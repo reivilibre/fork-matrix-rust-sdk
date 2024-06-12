@@ -25,6 +25,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use eyeball::SharedObservable;
+#[cfg(feature = "load-testing")]
+use goose::goose::GooseUser;
 use http::Method;
 use ruma::api::{
     error::{FromHttpResponseError, IntoHttpError},
@@ -53,11 +55,24 @@ pub(crate) struct HttpClient {
     pub(crate) inner: reqwest::Client,
     pub(crate) request_config: RequestConfig,
     next_request_id: Arc<AtomicU64>,
+    #[cfg(feature = "load-testing")]
+    user: GooseUser,
 }
 
 impl HttpClient {
-    pub(crate) fn new(inner: reqwest::Client, request_config: RequestConfig) -> Self {
-        HttpClient { inner, request_config, next_request_id: AtomicU64::new(0).into() }
+    pub(crate) fn new(
+        inner: reqwest::Client,
+        request_config: RequestConfig,
+        #[cfg(feature = "load-testing")]
+        user: GooseUser,
+    ) -> Self {
+        HttpClient {
+            inner,
+            request_config,
+            next_request_id: Arc::new(Default::default()),
+            #[cfg(feature = "load-testing")]
+            user,
+        }
     }
 
     fn get_request_id(&self) -> String {
@@ -187,7 +202,11 @@ impl HttpClient {
 
         // There's a bunch of state in send_request, factor out a pinned inner
         // future to reduce this size of futures that await this function.
-        match Box::pin(self.send_request::<R>(request, config, send_progress)).await {
+        match Box::pin(self.send_request::<R>(
+            request, config, send_progress,
+            #[cfg(feature = "load-testing")]
+            self.user.clone(),
+        )).await {
             Ok(response) => {
                 debug!("Got response");
                 Ok(response)
@@ -228,33 +247,3 @@ async fn response_to_http_response(
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
 }
 
-#[cfg(feature = "experimental-oidc")]
-impl tower::Service<http_old::Request<Bytes>> for HttpClient {
-    type Response = http_old::Response<Bytes>;
-    type Error = tower::BoxError;
-    type Future = futures_core::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: http_old::Request<Bytes>) -> Self::Future {
-        let inner = self.inner.clone();
-
-        let fut = async move {
-            native::send_request(
-                &inner,
-                &req.to_http_new(),
-                DEFAULT_REQUEST_TIMEOUT,
-                Default::default(),
-            )
-            .await
-            .map(ToHttpOld::to_http_old)
-            .map_err(Into::into)
-        };
-        Box::pin(fut)
-    }
-}

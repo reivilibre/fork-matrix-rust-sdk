@@ -14,6 +14,9 @@
 // limitations under the License.
 
 use std::{fmt, sync::Arc};
+use std::fmt::{Debug};
+#[cfg(feature = "load-testing")]
+use goose::prelude::GooseUser;
 
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
 use ruma::{
@@ -94,7 +97,10 @@ pub struct ClientBuilder {
     base_client: Option<BaseClient>,
     #[cfg(feature = "e2e-encryption")]
     encryption_settings: EncryptionSettings,
+    #[cfg(feature = "load-testing")]
+    goose_user: Option<GooseUser>,
 }
+
 
 impl ClientBuilder {
     pub(crate) fn new() -> Self {
@@ -111,6 +117,8 @@ impl ClientBuilder {
             base_client: None,
             #[cfg(feature = "e2e-encryption")]
             encryption_settings: Default::default(),
+            #[cfg(feature = "load-testing")]
+            goose_user: None,
         }
     }
 
@@ -364,6 +372,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the GooseUser used for load testing.
+    #[cfg(feature = "load-testing")]
+    pub fn with_goose_user(mut self, user: &mut GooseUser) -> Self {
+        self.goose_user = Some(user.clone());
+        self
+    }
+
     /// Enables specific encryption settings that will persist throughout the
     /// entire lifetime of the `Client`.
     #[cfg(feature = "e2e-encryption")]
@@ -407,7 +422,12 @@ impl ClientBuilder {
             BaseClient::with_store_config(build_store_config(self.store_config).await?)
         };
 
-        let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
+        let http_client = HttpClient::new(
+            inner_http_client.clone(),
+            self.request_config,
+            #[cfg(feature = "load-testing")]
+            self.goose_user.expect("should be a valid GooseUser. Did you forget to call with_goose_user?")
+        );
 
         let (homeserver, well_known) = match homeserver_cfg {
             HomeserverConfig::Url(url) => (url, None),

@@ -24,13 +24,17 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use eyeball::SharedObservable;
 use http::header::CONTENT_LENGTH;
-use reqwest::Certificate;
+use reqwest::{Certificate};
 use ruma::api::{
     client::error::{ErrorBody as ClientApiErrorBody, ErrorKind as ClientApiErrorKind, RetryAfter},
     error::FromHttpResponseError,
     IncomingResponse, OutgoingRequest,
 };
 use tracing::{info, warn};
+#[cfg(feature = "load-testing")]
+use goose::{prelude::*};
+#[cfg(feature = "load-testing")]
+use reqwest::RequestBuilder;
 
 use super::{response_to_http_response, HttpClient, TransmissionProgress, DEFAULT_REQUEST_TIMEOUT};
 use crate::{config::RequestConfig, error::HttpError, RumaApiError};
@@ -41,6 +45,8 @@ impl HttpClient {
         request: http::Request<Bytes>,
         config: RequestConfig,
         send_progress: SharedObservable<TransmissionProgress>,
+        #[cfg(feature = "load-testing")]
+        user: GooseUser,
     ) -> Result<R::IncomingResponse, HttpError>
     where
         R: OutgoingRequest + Debug,
@@ -95,7 +101,7 @@ impl HttpClient {
                     }
                 };
 
-                let response = send_request(&self.inner, &request, config.timeout, send_progress)
+                let response = send_request(&self.inner, &request, config.timeout, send_progress, #[cfg(feature = "load-testing")] user.clone())
                     .await
                     .map_err(error_type)?;
 
@@ -183,6 +189,7 @@ impl HttpSettings {
     }
 }
 
+#[cfg(not(feature = "load-testing"))]
 pub(super) async fn send_request(
     client: &reqwest::Client,
     request: &http::Request<Bytes>,
@@ -230,6 +237,131 @@ pub(super) async fn send_request(
 
     let response = client.execute(request).await?;
     Ok(response_to_http_response(response).await?)
+}
+
+#[cfg(feature = "load-testing")]
+pub(super) async fn send_request(
+    _client: &reqwest::Client,
+    request: &http::Request<Bytes>,
+    timeout: Duration,
+    _send_progress: SharedObservable<TransmissionProgress>,
+    mut user: GooseUser,
+) -> Result<http::Response<Bytes>, HttpError> {
+    let request = clone_request(request);
+
+    #[allow(unused_mut)]
+        let mut request = reqwest::Request::try_from(request)?;
+
+    // let response = self.execute(request).await?;
+
+    // Goose integration start
+    // println!("Got response: {:?}", response);
+
+    let request_name = request.try_clone().unwrap();
+    let mut name = request_name.url().as_str().to_owned();
+    // let request_body = reqwest::Request::try_clone(&request).unwrap();
+    // let body = request_body.body().unwrap().as_bytes().unwrap().to_vec();
+
+    // Converting to Goose request
+    // println!("Raw request: {:?}", request);
+    // println!("Request parameters: {:?}", std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()));
+
+    // Method not converted from request builder...
+    // let method: GooseMethod;
+    // match request.method() {
+    //     &http::Method::GET => method = GooseMethod::Get,
+    //     &http::Method::POST => method = GooseMethod::Post,
+    //     &http::Method::PUT => method = GooseMethod::Put,
+    //     &http::Method::DELETE => method = GooseMethod::Delete,
+    //     &http::Method::HEAD => method = GooseMethod::Head,
+    //     &http::Method::PATCH => method = GooseMethod::Patch,
+    //     unsupported => { println!("Unsupported method {:?} Defaulting to GET...", unsupported); method = GooseMethod::Get }
+    // }
+
+
+    let request_builder = RequestBuilder::from_parts(user.client.clone(), request);
+    // request_builder = request_builder.body(body);
+    // request_builder.body(request.body().unwrap().clone());
+
+    // Fix endpoint naming for reports
+    if let Some(index) = name.find('?') {
+        name.truncate(index);
+    }
+    if let Some(index) = name.find('!') {
+        let (first, last) = name.split_at(index);
+        match last.find('/') {
+            Some(index) => name = first.to_owned() + "_" + &last[index .. last.len()],
+            None => name = first.to_owned() + "_",
+        }
+    }
+    if let Some(index) = name.find('@') {
+        let (first, last) = name.split_at(index);
+        match last.find('/') {
+            Some(index) => name = first.to_owned() + "_" + &last[index .. last.len()],
+            None => name = first.to_owned() + "_",
+        }
+    }
+    if let Some(index) = name.find('$') {
+        let (first, last) = name.split_at(index);
+        match last.find('/') {
+            Some(index) => name = first.to_owned() + "_" + &last[index .. last.len()],
+            None => name = first.to_owned() + "_",
+        }
+    }
+    if let Some(index) = name.find("m.room.message/") {
+        name.truncate(index + "m.room.message/".len());
+        name.push('_');
+    }
+    if let Some(index) = name.find("m.reaction/") {
+        name.truncate(index + "m.reaction/".len());
+        name.push('_');
+    }
+
+    let goose_request = GooseRequest::builder()
+        // Goose will prepend a host name to this path.
+        // .path(&*homeserver)
+        .name(&*name)
+        // .method(method)
+        .set_request_builder(request_builder)
+        .build();
+
+    // println!("Sending goose request {:?}", goose_request);
+
+    // Note: Consider changing to using mutex since a single goose user owns two threads (sync_forever and logic thread)
+    // Also improve error handling
+    match user.request(goose_request).await {
+        Ok(goose_response) => {
+            // If required in the future, consider adding global response vector for access in scripts.
+            // Easier to maintain than propagating response results through all the various function
+            // signatures
+            let response = goose_response.response?;
+
+            // println!("Got response: {:?}", goose_response);
+
+            // Goose integration end
+
+            Ok(response_to_http_response(response).await?)
+        },
+        Err(err) => {
+            // If required in the future, consider adding global error vector for access in scripts.
+            // Easier to maintain than propagating error results through all the various function
+            // signatures
+            println!("Error sending request: {:?}", err);
+
+            match *err {
+                TransactionError::Reqwest(e) => Err(HttpError::Reqwest(e)),
+                // For now, sending random error since there is no error mapping between types
+                _ => Err(HttpError::NotClientRequest),
+
+                // TransactionError::Url(_) => todo!(),
+                // TransactionError::RequestFailed { raw_request } => todo!(),
+                // TransactionError::RequestCanceled { source } => todo!(),
+                // TransactionError::MetricsFailed { source } => todo!(),
+                // TransactionError::LoggerFailed { source } => todo!(),
+                // TransactionError::InvalidMethod { method } => todo!(),
+            }
+        },
+    }
 }
 
 // Clones all request parts except the extensions which can't be cloned.
