@@ -23,18 +23,18 @@ use backoff::{future::retry, Error as RetryError, ExponentialBackoff};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use eyeball::SharedObservable;
+#[cfg(feature = "load-testing")]
+use goose::prelude::*;
 use http::header::CONTENT_LENGTH;
-use reqwest::{Certificate};
+use reqwest::Certificate;
+#[cfg(feature = "load-testing")]
+use reqwest::RequestBuilder;
 use ruma::api::{
     client::error::{ErrorBody as ClientApiErrorBody, ErrorKind as ClientApiErrorKind, RetryAfter},
     error::FromHttpResponseError,
     IncomingResponse, OutgoingRequest,
 };
 use tracing::{info, warn};
-#[cfg(feature = "load-testing")]
-use goose::{prelude::*};
-#[cfg(feature = "load-testing")]
-use reqwest::RequestBuilder;
 
 use super::{response_to_http_response, HttpClient, TransmissionProgress, DEFAULT_REQUEST_TIMEOUT};
 use crate::{config::RequestConfig, error::HttpError, RumaApiError};
@@ -45,8 +45,7 @@ impl HttpClient {
         request: http::Request<Bytes>,
         config: RequestConfig,
         send_progress: SharedObservable<TransmissionProgress>,
-        #[cfg(feature = "load-testing")]
-        user: GooseUser,
+        #[cfg(feature = "load-testing")] user: GooseUser,
     ) -> Result<R::IncomingResponse, HttpError>
     where
         R: OutgoingRequest + Debug,
@@ -101,9 +100,16 @@ impl HttpClient {
                     }
                 };
 
-                let response = send_request(&self.inner, &request, config.timeout, send_progress, #[cfg(feature = "load-testing")] user.clone())
-                    .await
-                    .map_err(error_type)?;
+                let response = send_request(
+                    &self.inner,
+                    &request,
+                    config.timeout,
+                    send_progress,
+                    #[cfg(feature = "load-testing")]
+                    user.clone(),
+                )
+                .await
+                .map_err(error_type)?;
 
                 let status_code = response.status();
                 let response_size = ByteSize(response.body().len().try_into().unwrap_or(u64::MAX));
@@ -250,7 +256,7 @@ pub(super) async fn send_request(
     let request = clone_request(request);
 
     #[allow(unused_mut)]
-        let mut request = reqwest::Request::try_from(request)?;
+    let mut request = reqwest::Request::try_from(request)?;
 
     // let response = self.execute(request).await?;
 
@@ -278,7 +284,6 @@ pub(super) async fn send_request(
     //     unsupported => { println!("Unsupported method {:?} Defaulting to GET...", unsupported); method = GooseMethod::Get }
     // }
 
-
     let request_builder = RequestBuilder::from_parts(user.client.clone(), request);
     // request_builder = request_builder.body(body);
     // request_builder.body(request.body().unwrap().clone());
@@ -290,21 +295,21 @@ pub(super) async fn send_request(
     if let Some(index) = name.find('!') {
         let (first, last) = name.split_at(index);
         match last.find('/') {
-            Some(index) => name = first.to_owned() + "_" + &last[index .. last.len()],
+            Some(index) => name = first.to_owned() + "_" + &last[index..last.len()],
             None => name = first.to_owned() + "_",
         }
     }
     if let Some(index) = name.find('@') {
         let (first, last) = name.split_at(index);
         match last.find('/') {
-            Some(index) => name = first.to_owned() + "_" + &last[index .. last.len()],
+            Some(index) => name = first.to_owned() + "_" + &last[index..last.len()],
             None => name = first.to_owned() + "_",
         }
     }
     if let Some(index) = name.find('$') {
         let (first, last) = name.split_at(index);
         match last.find('/') {
-            Some(index) => name = first.to_owned() + "_" + &last[index .. last.len()],
+            Some(index) => name = first.to_owned() + "_" + &last[index..last.len()],
             None => name = first.to_owned() + "_",
         }
     }
@@ -341,7 +346,7 @@ pub(super) async fn send_request(
             // Goose integration end
 
             Ok(response_to_http_response(response).await?)
-        },
+        }
         Err(err) => {
             // If required in the future, consider adding global error vector for access in scripts.
             // Easier to maintain than propagating error results through all the various function
@@ -352,7 +357,6 @@ pub(super) async fn send_request(
                 TransactionError::Reqwest(e) => Err(HttpError::Reqwest(e)),
                 // For now, sending random error since there is no error mapping between types
                 _ => Err(HttpError::NotClientRequest),
-
                 // TransactionError::Url(_) => todo!(),
                 // TransactionError::RequestFailed { raw_request } => todo!(),
                 // TransactionError::RequestCanceled { source } => todo!(),
@@ -360,7 +364,7 @@ pub(super) async fn send_request(
                 // TransactionError::LoggerFailed { source } => todo!(),
                 // TransactionError::InvalidMethod { method } => todo!(),
             }
-        },
+        }
     }
 }
 

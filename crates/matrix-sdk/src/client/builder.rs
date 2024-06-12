@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt, sync::Arc};
-use std::fmt::{Debug};
 #[cfg(feature = "load-testing")]
 use goose::prelude::GooseUser;
+use std::fmt::Debug;
+use std::{fmt, sync::Arc};
 
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
 use ruma::{
@@ -100,7 +100,6 @@ pub struct ClientBuilder {
     #[cfg(feature = "load-testing")]
     goose_user: Option<GooseUser>,
 }
-
 
 impl ClientBuilder {
     pub(crate) fn new() -> Self {
@@ -426,7 +425,8 @@ impl ClientBuilder {
             inner_http_client.clone(),
             self.request_config,
             #[cfg(feature = "load-testing")]
-            self.goose_user.expect("should be a valid GooseUser. Did you forget to call with_goose_user?")
+            self.goose_user
+                .expect("should be a valid GooseUser. Did you forget to call with_goose_user?"),
         );
 
         let (homeserver, well_known) = match homeserver_cfg {

@@ -63,8 +63,7 @@ impl HttpClient {
     pub(crate) fn new(
         inner: reqwest::Client,
         request_config: RequestConfig,
-        #[cfg(feature = "load-testing")]
-        user: GooseUser,
+        #[cfg(feature = "load-testing")] user: GooseUser,
     ) -> Self {
         HttpClient {
             inner,
@@ -203,10 +202,14 @@ impl HttpClient {
         // There's a bunch of state in send_request, factor out a pinned inner
         // future to reduce this size of futures that await this function.
         match Box::pin(self.send_request::<R>(
-            request, config, send_progress,
+            request,
+            config,
+            send_progress,
             #[cfg(feature = "load-testing")]
             self.user.clone(),
-        )).await {
+        ))
+        .await
+        {
             Ok(response) => {
                 debug!("Got response");
                 Ok(response)
@@ -270,9 +273,9 @@ impl tower::Service<http_old::Request<Bytes>> for HttpClient {
                 DEFAULT_REQUEST_TIMEOUT,
                 Default::default(),
             )
-                .await
-                .map(ToHttpOld::to_http_old)
-                .map_err(Into::into)
+            .await
+            .map(ToHttpOld::to_http_old)
+            .map_err(Into::into)
         };
         Box::pin(fut)
     }
