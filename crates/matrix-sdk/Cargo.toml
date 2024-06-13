@@ -113,7 +113,7 @@ urlencoding = "2.1.3"
 uuid = { version = "1.4.1", features = ["serde", "v4"], optional = true }
 vodozemac = { workspace = true }
 zeroize = { workspace = true }
-goose = { git = "https://github.com/S7evinK/goose", rev = "e1a151a3f2029eef9239992c419455e0bd2f1a11", optional = true }
+goose = { git = "https://github.com/tag1consulting/goose", rev = "7c1e5849a6883175779f339d586b93faaebfadb9", optional = true }
 goose-eggs =  { git = "https://github.com/tag1consulting/goose-eggs", rev = "428939d1634acd3224d1f635433eee56ab98e605", optional = true}
 
 [dependencies.image]

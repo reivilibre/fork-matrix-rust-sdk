@@ -2228,7 +2228,7 @@ dependencies = [
 [[package]]
 name = "goose"
 version = "0.17.3-dev"
-source = "git+https://github.com/S7evinK/goose?rev=e1a151a3f2029eef9239992c419455e0bd2f1a11#e1a151a3f2029eef9239992c419455e0bd2f1a11"
+source = "git+https://github.com/tag1consulting/goose?rev=7c1e5849a6883175779f339d586b93faaebfadb9#7c1e5849a6883175779f339d586b93faaebfadb9"
 dependencies = [
  "async-trait",
  "chrono",
