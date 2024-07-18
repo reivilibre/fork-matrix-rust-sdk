@@ -29,15 +29,14 @@ use http::header::CONTENT_LENGTH;
 use reqwest::Certificate;
 #[cfg(feature = "load-testing")]
 use reqwest::RequestBuilder;
-use ruma::api::{
-    client::error::{ErrorBody as ClientApiErrorBody, ErrorKind as ClientApiErrorKind, RetryAfter},
-    error::FromHttpResponseError,
-    IncomingResponse, OutgoingRequest,
-};
-use tracing::{info, warn};
+use ruma::api::{error::FromHttpResponseError, IncomingResponse, OutgoingRequest};
+use tracing::{debug, info, warn};
 
 use super::{response_to_http_response, HttpClient, TransmissionProgress, DEFAULT_REQUEST_TIMEOUT};
-use crate::{config::RequestConfig, error::HttpError, RumaApiError};
+use crate::{
+    config::RequestConfig,
+    error::{HttpError, RetryKind},
+};
 
 impl HttpClient {
     pub(super) async fn send_request<R>(
@@ -58,6 +57,8 @@ impl HttpClient {
         let send_request = || {
             let send_progress = send_progress.clone();
             async {
+                debug!(num_attempt = retry_count.load(Ordering::SeqCst), "Sending request");
+
                 let stop = if let Some(retry_limit) = config.retry_limit {
                     retry_count.fetch_add(1, Ordering::Relaxed) >= retry_limit
                 } else {
@@ -68,35 +69,11 @@ impl HttpClient {
                 let error_type = if stop {
                     RetryError::Permanent
                 } else {
-                    |err: HttpError| {
-                        if let Some(api_error) = err.as_ruma_api_error() {
-                            let status_code = match api_error {
-                                RumaApiError::ClientApi(e) => match e.body {
-                                    ClientApiErrorBody::Standard {
-                                        kind: ClientApiErrorKind::LimitExceeded { retry_after },
-                                        ..
-                                    } => {
-                                        let retry_after =
-                                            retry_after.and_then(|retry_after| match retry_after {
-                                                RetryAfter::Delay(d) => Some(d),
-                                                RetryAfter::DateTime(_) => None,
-                                            });
-                                        return RetryError::Transient { err, retry_after };
-                                    }
-                                    _ => Some(e.status_code),
-                                },
-                                RumaApiError::Uiaa(_) => None,
-                                RumaApiError::Other(e) => Some(e.status_code),
-                            };
-
-                            if let Some(status_code) = status_code {
-                                if status_code.is_server_error() {
-                                    return RetryError::Transient { err, retry_after: None };
-                                }
-                            }
+                    |err: HttpError| match err.retry_kind() {
+                        RetryKind::Transient { retry_after } => {
+                            RetryError::Transient { err, retry_after }
                         }
-
-                        RetryError::Permanent(err)
+                        RetryKind::Permanent => RetryError::Permanent(err),
                     }
                 };
 

@@ -2,6 +2,13 @@
 
 Changes:
 
+- Log the content of received `m.room_key.withheld` to-device events.
+  ([#3591](https://github.com/matrix-org/matrix-rust-sdk/pull/3591))
+
+- Attempt to decrypt bundled events (reactions and the latest thread reply) if
+  they are found in the unsigned part of an event.
+  ([#3468](https://github.com/matrix-org/matrix-rust-sdk/pull/3468))
+
 - Sign the device keys with the user-identity (i.e. cross-signing keys) if
   we're uploading the device keys and if the cross-signing keys are available.
   This approach eliminates the need to upload signatures in a separate request,
@@ -53,6 +60,11 @@ Deprecations:
 
 Additions:
 
+- Expose new method `OlmMachine::room_keys_withheld_received_stream`, to allow
+  applications to receive notifications about received `m.room_key.withheld`
+  events.
+  ([#3660](https://github.com/matrix-org/matrix-rust-sdk/pull/3660)),
+  ([#3674](https://github.com/matrix-org/matrix-rust-sdk/pull/3674))
 
 - Expose new method `OlmMachine::clear_crypto_cache()`, with FFI bindings
   ([#3462](https://github.com/matrix-org/matrix-rust-sdk/pull/3462))
@@ -104,7 +116,7 @@ Additions:
   ([#3194](https://github.com/matrix-org/matrix-rust-sdk/pull/3194))
 
 
-## 0.7.1 
+## 0.7.1
 
 Security fixes:
 

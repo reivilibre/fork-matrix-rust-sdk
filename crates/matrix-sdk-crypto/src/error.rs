@@ -165,6 +165,19 @@ pub enum EventError {
     MismatchedRoom(OwnedRoomId, Option<OwnedRoomId>),
 }
 
+/// Error type describing different errors that can happen when we create an
+/// Olm session from a pickle.
+#[derive(Error, Debug)]
+pub enum SessionUnpickleError {
+    /// The device keys are missing the signing key
+    #[error("the device keys are missing the signing key")]
+    MissingSigningKey,
+
+    /// The device keys are missing the identity key
+    #[error("the device keys are missing the identity key")]
+    MissingIdentityKey,
+}
+
 /// Error type describing different errors that happen when we check or create
 /// signatures for a Matrix JSON object.
 #[derive(Error, Debug)]
@@ -284,6 +297,10 @@ pub enum SessionCreationError {
     /// Error when creating an Olm Session from an incoming Olm message.
     #[error(transparent)]
     InboundCreation(#[from] vodozemac::olm::SessionCreationError),
+
+    /// The given device keys are invalid.
+    #[error("The given device keys are invalid")]
+    InvalidDeviceKeys(#[from] SignatureError),
 }
 
 /// Errors that can be returned by

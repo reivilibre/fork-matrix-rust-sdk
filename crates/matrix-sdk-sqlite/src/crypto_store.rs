@@ -32,8 +32,7 @@ use matrix_sdk_crypto::{
         RoomSettings,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
-    Account, GossipRequest, GossippedSecret, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
-    TrackedUser,
+    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
@@ -780,9 +779,11 @@ impl CryptoStore for SqliteCryptoStore {
         }
 
         let this = self.clone();
-        self.acquire()
+        let clear_caches = self
+            .acquire()
             .await?
             .with_transaction(move |txn| {
+                let mut clear_caches = false;
                 if let Some(pickled_private_identity) = &pickled_private_identity {
                     let serialized_private_identity =
                         this.serialize_value(pickled_private_identity)?;
@@ -804,7 +805,16 @@ impl CryptoStore for SqliteCryptoStore {
                     txn.set_kv("backup_version_v1", &serialized_backup_version)?;
                 }
 
+                let account_info = this.get_static_account();
                 for device in changes.devices.new.iter().chain(&changes.devices.changed) {
+                    // If our own device key changes, we need to clear the
+                    // session cache because the sessions contain a copy of our
+                    // device key.
+                    if account_info.clone().is_some_and(|info| {
+                        info.user_id == device.user_id() && info.device_id == device.device_id()
+                    }) {
+                        clear_caches = true;
+                    }
                     let user_id = this.encode_key("device", device.user_id().as_bytes());
                     let device_id = this.encode_key("device", device.device_id().as_bytes());
                     let data = this.serialize_value(&device)?;
@@ -875,9 +885,13 @@ impl CryptoStore for SqliteCryptoStore {
                     txn.set_secret(&secret_name, &value)?;
                 }
 
-                Ok::<_, Error>(())
+                Ok::<_, Error>(clear_caches)
             })
             .await?;
+
+        if clear_caches {
+            self.clear_caches().await;
+        }
 
         Ok(())
     }
@@ -905,9 +919,9 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn get_sessions(&self, sender_key: &str) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
-        let account_info = self.get_static_account().ok_or(Error::AccountUnset)?;
-
         if self.session_cache.get(sender_key).is_none() {
+            let device_keys = self.get_own_device().await?.as_device_keys().clone();
+
             let sessions = self
                 .acquire()
                 .await?
@@ -916,12 +930,8 @@ impl CryptoStore for SqliteCryptoStore {
                 .into_iter()
                 .map(|bytes| {
                     let pickle = self.deserialize_value(&bytes)?;
-                    Ok(Session::from_pickle(
-                        account_info.user_id.clone(),
-                        account_info.device_id.clone(),
-                        account_info.identity_keys.clone(),
-                        pickle,
-                    ))
+                    Session::from_pickle(device_keys.clone(), pickle)
+                        .map_err(|_| Error::AccountUnset)
                 })
                 .collect::<Result<_>>()?;
 
@@ -1081,7 +1091,7 @@ impl CryptoStore for SqliteCryptoStore {
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>> {
+    ) -> Result<Option<DeviceData>> {
         let user_id = self.encode_key("device", user_id.as_bytes());
         let device_id = self.encode_key("device", device_id.as_bytes());
         Ok(self
@@ -1096,7 +1106,7 @@ impl CryptoStore for SqliteCryptoStore {
     async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         let user_id = self.encode_key("device", user_id.as_bytes());
         self.acquire()
             .await?
@@ -1104,13 +1114,18 @@ impl CryptoStore for SqliteCryptoStore {
             .await?
             .into_iter()
             .map(|value| {
-                let device: ReadOnlyDevice = self.deserialize_value(&value)?;
+                let device: DeviceData = self.deserialize_value(&value)?;
                 Ok((device.device_id().to_owned(), device))
             })
             .collect()
     }
 
-    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<ReadOnlyUserIdentities>> {
+    async fn get_own_device(&self) -> Result<DeviceData> {
+        let account_info = self.get_static_account().ok_or(Error::AccountUnset)?;
+        Ok(self.get_device(&account_info.user_id, &account_info.device_id).await?.unwrap())
+    }
+
+    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentityData>> {
         let user_id = self.encode_key("identity", user_id.as_bytes());
         Ok(self
             .acquire()
@@ -1307,16 +1322,123 @@ impl CryptoStore for SqliteCryptoStore {
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk_crypto::{cryptostore_integration_tests, cryptostore_integration_tests_time};
+    use std::path::PathBuf;
+
+    use matrix_sdk_crypto::{
+        cryptostore_integration_tests, cryptostore_integration_tests_time, store::CryptoStore,
+    };
+    use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
+    use similar_asserts::assert_eq;
     use tempfile::{tempdir, TempDir};
+    use tokio::fs;
 
     use super::SqliteCryptoStore;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 
-    async fn get_store(name: &str, passphrase: Option<&str>) -> SqliteCryptoStore {
+    struct TestDb {
+        // Needs to be kept alive because the Drop implementation for TempDir deletes the
+        // directory.
+        #[allow(dead_code)]
+        dir: TempDir,
+        database: SqliteCryptoStore,
+    }
+
+    async fn get_test_db() -> TestDb {
+        let db_name = "matrix-sdk-crypto.sqlite3";
+
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let database_path = manifest_path.join("testing/data/storage").join(db_name);
+
+        let tmpdir = tempdir().unwrap();
+        let destination = tmpdir.path().join(db_name);
+
+        // Copy the test database to the tempdir so our test runs are idempotent.
+        std::fs::copy(&database_path, destination).unwrap();
+
+        let database =
+            SqliteCryptoStore::open(tmpdir.path(), None).await.expect("Can't open the test store");
+
+        TestDb { dir: tmpdir, database }
+    }
+
+    /// Test that we didn't regress in our storage layer by loading data from a
+    /// pre-filled database, or in other words use a test vector for this.
+    #[async_test]
+    async fn open_test_vector_store() {
+        let TestDb { dir: _, database } = get_test_db().await;
+
+        let account = database
+            .load_account()
+            .await
+            .unwrap()
+            .expect("The test database is prefilled with data, we should find an account");
+
+        let user_id = account.user_id();
+        let device_id = account.device_id();
+
+        assert_eq!(
+            user_id.as_str(),
+            "@pjtest:synapse-oidc.element.dev",
+            "The user ID should match to the one we expect."
+        );
+
+        assert_eq!(
+            device_id.as_str(),
+            "v4TqgcuIH6",
+            "The device ID should match to the one we expect."
+        );
+
+        let device = database
+            .get_device(user_id, device_id)
+            .await
+            .unwrap()
+            .expect("Our own device should be found in the store.");
+
+        assert_eq!(device.device_id(), device_id);
+        assert_eq!(device.user_id(), user_id);
+
+        assert_eq!(
+            device.ed25519_key().expect("The device should have a Ed25519 key.").to_base64(),
+            "+cxl1Gl3du5i7UJwfWnoRDdnafFF+xYdAiTYYhYLr8s"
+        );
+
+        assert_eq!(
+            device.curve25519_key().expect("The device should have a Curve25519 key.").to_base64(),
+            "4SL9eEUlpyWSUvjljC5oMjknHQQJY7WZKo5S1KL/5VU"
+        );
+
+        let identity = database
+            .get_user_identity(user_id)
+            .await
+            .unwrap()
+            .expect("The store should contain an identity.");
+
+        assert_eq!(identity.user_id(), user_id);
+
+        let identity = identity
+            .own()
+            .expect("The identity should be of the correct type, it should be our own identity.");
+
+        let master_key = identity
+            .master_key()
+            .get_first_key()
+            .expect("Our own identity should have a master key");
+
+        assert_eq!(master_key.to_base64(), "iCUEtB1RwANeqRa5epDrblLk4mer/36sylwQ5hYY3oE");
+    }
+
+    async fn get_store(
+        name: &str,
+        passphrase: Option<&str>,
+        clear_data: bool,
+    ) -> SqliteCryptoStore {
         let tmpdir_path = TMP_DIR.path().join(name);
+
+        if clear_data {
+            let _ = fs::remove_dir_all(&tmpdir_path).await;
+        }
 
         SqliteCryptoStore::open(tmpdir_path.to_str().unwrap(), passphrase)
             .await
@@ -1331,19 +1453,29 @@ mod tests {
 mod encrypted_tests {
     use matrix_sdk_crypto::{
         cryptostore_integration_tests, cryptostore_integration_tests_time,
-        store::{Changes, CryptoStore as _, PendingChanges},
+        store::{Changes, CryptoStore as _, DeviceChanges, PendingChanges},
+        DeviceData,
     };
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use tempfile::{tempdir, TempDir};
+    use tokio::fs;
 
     use super::SqliteCryptoStore;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 
-    async fn get_store(name: &str, passphrase: Option<&str>) -> SqliteCryptoStore {
+    async fn get_store(
+        name: &str,
+        passphrase: Option<&str>,
+        clear_data: bool,
+    ) -> SqliteCryptoStore {
         let tmpdir_path = TMP_DIR.path().join(name);
         let pass = passphrase.unwrap_or("default_test_password");
+
+        if clear_data {
+            let _ = fs::remove_dir_all(&tmpdir_path).await;
+        }
 
         SqliteCryptoStore::open(tmpdir_path.to_str().unwrap(), Some(pass))
             .await
@@ -1352,7 +1484,7 @@ mod encrypted_tests {
 
     #[async_test]
     async fn cache_cleared() {
-        let store = get_store("cache_cleared", None).await;
+        let store = get_store("cache_cleared", None, true).await;
         // Given we created a session and saved it in the store
         let (account, session) = cryptostore_integration_tests::get_account_and_session().await;
         let sender_key = session.sender_key.to_base64();
@@ -1369,6 +1501,42 @@ mod encrypted_tests {
 
         // When we clear the caches
         store.clear_caches().await;
+
+        // Then the session is no longer in the cache
+        assert!(
+            store.session_cache.get(&sender_key).is_none(),
+            "Session should not be in the cache!"
+        );
+    }
+
+    #[async_test]
+    async fn cache_cleared_after_device_update() {
+        let store = get_store("cache_cleared_after_device_update", None, true).await;
+        // Given we created a session and saved it in the store
+        let (account, session) = cryptostore_integration_tests::get_account_and_session().await;
+        let sender_key = session.sender_key.to_base64();
+
+        store
+            .save_pending_changes(PendingChanges { account: Some(account.deep_clone()) })
+            .await
+            .expect("Can't save account");
+
+        let changes = Changes { sessions: vec![session.clone()], ..Default::default() };
+        store.save_changes(changes).await.unwrap();
+
+        store.session_cache.get(&sender_key).expect("We should have a session");
+
+        // When we save a new version of our device keys
+        store
+            .save_changes(Changes {
+                devices: DeviceChanges {
+                    new: vec![DeviceData::from_account(&account)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         // Then the session is no longer in the cache
         assert!(

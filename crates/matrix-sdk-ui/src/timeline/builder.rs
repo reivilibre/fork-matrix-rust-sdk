@@ -18,7 +18,6 @@ use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     event_cache::{EventsOrigin, RoomEventCacheUpdate},
     executor::spawn,
-    send_queue::{LocalEcho, RoomSendQueueUpdate},
     Room,
 };
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
@@ -32,10 +31,7 @@ use super::{
     Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
 use crate::{
-    timeline::{
-        event_handler::TimelineEventKind, event_item::RemoteEventOrigin, inner::TimelineEnd,
-        EventSendState,
-    },
+    timeline::{event_item::RemoteEventOrigin, inner::TimelineEnd},
     unable_to_decrypt_hook::UtdHookManager,
 };
 
@@ -267,22 +263,13 @@ impl TimelineBuilder {
         });
 
         let local_echo_listener_handle = if is_live {
-            Some(spawn({
-                let timeline = inner.clone();
-                let (local_echoes, mut listener) = room.send_queue().subscribe().await;
+            let timeline = inner.clone();
+            let (local_echoes, mut listener) = room.send_queue().subscribe().await?;
 
+            Some(spawn({
                 // Handles existing local echoes first.
                 for echo in local_echoes {
-                    timeline
-                        .handle_local_event(
-                            echo.transaction_id,
-                            TimelineEventKind::Message {
-                                content: echo.content,
-                                relations: Default::default(),
-                            },
-                            Some(echo.abort_handle),
-                        )
-                        .await;
+                    timeline.handle_local_echo(echo).await;
                 }
 
                 let span = info_span!(parent: Span::none(), "local_echo_handler", room_id = ?room.room_id());
@@ -294,48 +281,7 @@ impl TimelineBuilder {
 
                     loop {
                         match listener.recv().await {
-                            Ok(update) => match update {
-                                RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
-                                    transaction_id,
-                                    content,
-                                    abort_handle,
-                                }) => {
-                                    timeline
-                                        .handle_local_event(
-                                            transaction_id,
-                                            TimelineEventKind::Message {
-                                                content,
-                                                relations: Default::default(),
-                                            },
-                                            Some(abort_handle),
-                                        )
-                                        .await;
-                                }
-
-                                RoomSendQueueUpdate::CancelledLocalEvent { transaction_id } => {
-                                    if !timeline.discard_local_echo(&transaction_id).await {
-                                        warn!("couldn't find the local echo to discard");
-                                    }
-                                }
-
-                                RoomSendQueueUpdate::SendError { transaction_id, error } => {
-                                    timeline
-                                        .update_event_send_state(
-                                            &transaction_id,
-                                            EventSendState::SendingFailed { error },
-                                        )
-                                        .await;
-                                }
-
-                                RoomSendQueueUpdate::SentEvent { transaction_id, event_id } => {
-                                    timeline
-                                        .update_event_send_state(
-                                            &transaction_id,
-                                            EventSendState::Sent { event_id },
-                                        )
-                                        .await;
-                                }
-                            },
+                            Ok(update) => timeline.handle_room_send_queue_update(update).await,
 
                             Err(RecvError::Lagged(num_missed)) => {
                                 warn!("missed {num_missed} local echoes, ignoring those missed");

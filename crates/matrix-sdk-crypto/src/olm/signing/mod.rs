@@ -35,7 +35,7 @@ use crate::{
     requests::UploadSigningKeysRequest,
     store::SecretImportError,
     types::{DeviceKeys, MasterPubkey, SelfSigningPubkey, UserSigningPubkey},
-    Account, OwnUserIdentity, ReadOnlyDevice, ReadOnlyOwnUserIdentity, ReadOnlyUserIdentity,
+    Account, DeviceData, OtherUserIdentityData, OwnUserIdentity, OwnUserIdentityData,
 };
 
 /// Private cross signing identity.
@@ -193,7 +193,7 @@ impl PrivateCrossSigningIdentity {
     /// # Arguments
     ///
     /// * `secret_name` - The type of the cross signing key that should be
-    /// exported.
+    ///   exported.
     pub async fn export_secret(&self, secret_name: &SecretName) -> Option<String> {
         match secret_name {
             SecretName::CrossSigningMasterKey => {
@@ -315,10 +315,10 @@ impl PrivateCrossSigningIdentity {
     }
 
     /// Remove our private cross signing key if the public keys differ from
-    /// what's found in the `ReadOnlyOwnUserIdentity`.
+    /// what's found in the [`OwnUserIdentityData`].
     pub(crate) async fn clear_if_differs(
         &self,
-        public_identity: &ReadOnlyOwnUserIdentity,
+        public_identity: &OwnUserIdentityData,
     ) -> DiffResult {
         let result = self.get_public_identity_diff(public_identity).await;
 
@@ -339,7 +339,7 @@ impl PrivateCrossSigningIdentity {
 
     pub(crate) async fn get_public_identity_diff(
         &self,
-        public_identity: &ReadOnlyOwnUserIdentity,
+        public_identity: &OwnUserIdentityData,
     ) -> DiffResult {
         let master_differs = self
             .master_public_key()
@@ -413,12 +413,10 @@ impl PrivateCrossSigningIdentity {
         Ok((master, self_signing, user_signing))
     }
 
-    pub(crate) async fn to_public_identity(
-        &self,
-    ) -> Result<ReadOnlyOwnUserIdentity, SignatureError> {
+    pub(crate) async fn to_public_identity(&self) -> Result<OwnUserIdentityData, SignatureError> {
         let (master, self_signing, user_signing) = self.public_keys().await?;
 
-        let identity = ReadOnlyOwnUserIdentity::new(master, self_signing, user_signing)?;
+        let identity = OwnUserIdentityData::new(master, self_signing, user_signing)?;
         identity.mark_as_verified();
 
         Ok(identity)
@@ -427,7 +425,7 @@ impl PrivateCrossSigningIdentity {
     /// Sign the given public user identity with this private identity.
     pub(crate) async fn sign_user(
         &self,
-        user_identity: &ReadOnlyUserIdentity,
+        user_identity: &OtherUserIdentityData,
     ) -> Result<SignatureUploadRequest, SignatureError> {
         let master_key = self
             .user_signing_key
@@ -455,7 +453,7 @@ impl PrivateCrossSigningIdentity {
     /// Sign the given device keys with this identity.
     pub(crate) async fn sign_device(
         &self,
-        device: &ReadOnlyDevice,
+        device: &DeviceData,
     ) -> Result<SignatureUploadRequest, SignatureError> {
         let mut device_keys = device.as_device_keys().to_owned();
         device_keys.signatures.clear();
@@ -508,8 +506,8 @@ impl PrivateCrossSigningIdentity {
     /// # Arguments
     ///
     /// * `account` - The Olm account that is creating the new identity. The
-    /// account will sign the master key and the self signing key will sign the
-    /// account.
+    ///   account will sign the master key and the self signing key will sign
+    ///   the account.
     pub(crate) async fn with_account(
         account: &Account,
     ) -> (Self, UploadSigningKeysRequest, SignatureUploadRequest) {
@@ -578,7 +576,7 @@ impl PrivateCrossSigningIdentity {
     /// # Arguments
     ///
     /// * `pickle_key` - The key that should be used to encrypt the signing
-    /// object, must be 32 bytes long.
+    ///   object, must be 32 bytes long.
     ///
     /// # Panics
     ///
@@ -642,7 +640,7 @@ mod tests {
 
     use super::{pk_signing::Signing, PrivateCrossSigningIdentity};
     use crate::{
-        identities::{ReadOnlyDevice, ReadOnlyUserIdentity},
+        identities::{DeviceData, OtherUserIdentityData},
         olm::{Account, SignedJsonObject, VerifyJson},
         types::Signatures,
     };
@@ -751,7 +749,7 @@ mod tests {
         let account = Account::with_device_id(user_id(), device_id!("DEVICEID"));
         let (identity, _, _) = PrivateCrossSigningIdentity::with_account(&account).await;
 
-        let mut device = ReadOnlyDevice::from_account(&account);
+        let mut device = DeviceData::from_account(&account);
         let self_signing = identity.self_signing_key.lock().await;
         let self_signing = self_signing.as_ref().unwrap();
 
@@ -771,7 +769,7 @@ mod tests {
         let bob_account =
             Account::with_device_id(user_id!("@bob:localhost"), device_id!("DEVICEID"));
         let (bob_private, _, _) = PrivateCrossSigningIdentity::with_account(&bob_account).await;
-        let mut bob_public = ReadOnlyUserIdentity::from_private(&bob_private).await;
+        let mut bob_public = OtherUserIdentityData::from_private(&bob_private).await;
 
         let user_signing = identity.user_signing_key.lock().await;
         let user_signing = user_signing.as_ref().unwrap();

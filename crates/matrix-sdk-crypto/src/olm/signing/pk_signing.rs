@@ -26,7 +26,7 @@ use crate::{
         CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, Signatures, SigningKeys,
         UserSigningPubkey,
     },
-    ReadOnlyUserIdentity,
+    OtherUserIdentityData,
 };
 
 /// Error type reporting failures in the signing operations.
@@ -184,6 +184,8 @@ impl MasterSigning {
     }
 
     pub fn sign_subkey(&self, subkey: &mut CrossSigningKey) {
+        #[allow(clippy::needless_borrows_for_generic_args)]
+        // XXX: false positive, see https://github.com/rust-lang/rust-clippy/issues/12856
         let json_subkey = serde_json::to_value(&subkey).expect("Can't serialize cross signing key");
         let signature = self.inner.sign_json(json_subkey).expect("Can't sign cross signing keys");
 
@@ -225,7 +227,7 @@ impl UserSigning {
 
     pub fn sign_user(
         &self,
-        user: &ReadOnlyUserIdentity,
+        user: &OtherUserIdentityData,
     ) -> Result<CrossSigningKey, SignatureError> {
         let signatures = self.sign_user_helper(user)?;
         let mut master_key = user.master_key().as_ref().clone();
@@ -237,7 +239,7 @@ impl UserSigning {
 
     pub fn sign_user_helper(
         &self,
-        user: &ReadOnlyUserIdentity,
+        user: &OtherUserIdentityData,
     ) -> Result<Signatures, SignatureError> {
         let user_master: &CrossSigningKey = user.master_key().as_ref();
         let signature = self.inner.sign_json(serde_json::to_value(user_master)?)?;
@@ -289,6 +291,8 @@ impl SelfSigning {
     }
 
     pub(crate) fn sign_device(&self, device_keys: &mut DeviceKeys) -> Result<(), SignatureError> {
+        #[allow(clippy::needless_borrows_for_generic_args)]
+        // XXX: false positive, see https://github.com/rust-lang/rust-clippy/issues/12856
         let serialized = serde_json::to_value(&device_keys)?;
         let signature = self.inner.sign_json(serialized)?;
 

@@ -40,8 +40,9 @@ use crate::http_client::HttpSettings;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::OidcCtx;
 use crate::{
-    authentication::AuthCtx, config::RequestConfig, error::RumaApiError, http_client::HttpClient,
-    send_queue::SendQueueData, HttpError, IdParseError,
+    authentication::AuthCtx, client::ClientServerCapabilities, config::RequestConfig,
+    error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData, HttpError,
+    IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -87,7 +88,11 @@ use crate::{
 pub struct ClientBuilder {
     homeserver_cfg: Option<HomeserverConfig>,
     #[cfg(feature = "experimental-sliding-sync")]
+    requires_sliding_sync: bool,
+    #[cfg(feature = "experimental-sliding-sync")]
     sliding_sync_proxy: Option<String>,
+    #[cfg(feature = "experimental-sliding-sync")]
+    is_simplified_sliding_sync_enabled: bool,
     http_cfg: Option<HttpConfig>,
     store_config: BuilderStoreConfig,
     request_config: RequestConfig,
@@ -106,7 +111,12 @@ impl ClientBuilder {
         Self {
             homeserver_cfg: None,
             #[cfg(feature = "experimental-sliding-sync")]
+            requires_sliding_sync: false,
+            #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_proxy: None,
+            // Simplified MSC3575 is turned on by default for the SDK.
+            #[cfg(feature = "experimental-sliding-sync")]
+            is_simplified_sliding_sync_enabled: true,
             http_cfg: None,
             store_config: BuilderStoreConfig::Custom(StoreConfig::default()),
             request_config: Default::default(),
@@ -134,6 +144,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Ensures that the client is built with support for sliding-sync, either
+    /// by discovering a proxy through the homeserver's well-known or by
+    /// providing one through [`Self::sliding_sync_proxy`].
+    ///
+    /// In the future this may also perform a check for native support on the
+    /// homeserver.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn requires_sliding_sync(mut self) -> Self {
+        self.requires_sliding_sync = true;
+        self
+    }
+
     /// Set the sliding-sync proxy URL to use.
     ///
     /// This value is always used no matter if the homeserver URL was defined
@@ -144,6 +166,13 @@ impl ClientBuilder {
     #[cfg(feature = "experimental-sliding-sync")]
     pub fn sliding_sync_proxy(mut self, url: impl AsRef<str>) -> Self {
         self.sliding_sync_proxy = Some(url.as_ref().to_owned());
+        self
+    }
+
+    /// Enable or disable Simplified MSC3575.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn simplified_sliding_sync(mut self, enable: bool) -> Self {
+        self.is_simplified_sliding_sync_enabled = enable;
         self
     }
 
@@ -459,6 +488,12 @@ impl ClientBuilder {
             }
         }
 
+        #[cfg(feature = "experimental-sliding-sync")]
+        if self.requires_sliding_sync && sliding_sync_proxy.is_none() {
+            // In the future we will need to check for native support on the homeserver too.
+            return Err(ClientBuildError::SlidingSyncNotAvailable);
+        }
+
         let homeserver = Url::parse(&homeserver)?;
 
         let auth_ctx = Arc::new(AuthCtx {
@@ -472,17 +507,25 @@ impl ClientBuilder {
             oidc: OidcCtx::new(allow_insecure_oidc),
         });
 
-        let event_cache = OnceCell::new();
+        // Enable the send queue by default.
         let send_queue = Arc::new(SendQueueData::new(true));
+
+        let server_capabilities = ClientServerCapabilities {
+            server_versions: self.server_versions,
+            unstable_features: None,
+        };
+
+        let event_cache = OnceCell::new();
         let inner = ClientInner::new(
             auth_ctx,
             homeserver,
             #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_proxy,
+            #[cfg(feature = "experimental-sliding-sync")]
+            self.is_simplified_sliding_sync_enabled,
             http_client,
             base_client,
-            self.server_versions,
-            None,
+            server_capabilities,
             self.respect_login_well_known,
             event_cache,
             send_queue,
@@ -766,6 +809,10 @@ pub enum ClientBuildError {
     #[error("Error looking up the .well-known endpoint on auto-discovery")]
     AutoDiscovery(FromHttpResponseError<RumaApiError>),
 
+    /// The builder requires support for sliding sync but it isn't available.
+    #[error("The homeserver doesn't support sliding sync and a custom proxy wasn't configured.")]
+    SlidingSyncNotAvailable,
+
     /// An error encountered when trying to parse the homeserver url.
     #[error(transparent)]
     Url(#[from] url::ParseError),
@@ -1020,6 +1067,77 @@ pub(crate) mod tests {
         // proxy.
         #[cfg(feature = "experimental-sliding-sync")]
         assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:9012".parse().unwrap()));
+    }
+
+    /* Requires sliding sync */
+
+    #[async_test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_requires_sliding_sync_with_legacy_well_known() {
+        // Given a base server with a well-known file that points to a homeserver that
+        // doesn't support sliding sync.
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_well_known_json(&homeserver.uri(), None)),
+            )
+            .mount(&server)
+            .await;
+
+        // When building a client that requires sliding sync with the base server.
+        builder = builder.requires_sliding_sync().server_name_or_homeserver_url(server.uri());
+        let error = builder.build().await.unwrap_err();
+
+        // Then the operation should fail due to the lack of sliding sync support.
+        assert_matches!(error, ClientBuildError::SlidingSyncNotAvailable);
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_requires_sliding_sync_with_well_known() {
+        // Given a base server with a well-known file that points to a homeserver with a
+        // sliding sync proxy.
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
+                &homeserver.uri(),
+                Some("https://localhost:1234"),
+            )))
+            .mount(&server)
+            .await;
+
+        // When building a client that requires sliding sync with the base server.
+        builder = builder.requires_sliding_sync().server_name_or_homeserver_url(server.uri());
+        let _client = builder.build().await.unwrap();
+
+        // Then a client should be built with support for sliding sync.
+        assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_requires_sliding_sync_with_custom_proxy() {
+        // Given a homeserver without a well-known file and with a custom sliding sync
+        // proxy injected.
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+        builder = builder.sliding_sync_proxy("https://localhost:1234");
+
+        // When building a client that requires sliding sync with the server's URL.
+        builder = builder.requires_sliding_sync().server_name_or_homeserver_url(homeserver.uri());
+        let _client = builder.build().await.unwrap();
+
+        // Then a client should be built with support for sliding sync.
+        assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
     }
 
     /* Helper functions */

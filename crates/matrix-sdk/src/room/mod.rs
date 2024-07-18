@@ -20,7 +20,8 @@ use matrix_sdk_base::{
     },
     instant::Instant,
     store::StateStoreExt,
-    ComposerDraft, RoomMemberships, StateChanges, StateStoreDataKey, StateStoreDataValue,
+    ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
+    StateStoreDataValue,
 };
 use matrix_sdk_common::timeout::timeout;
 use mime::Mime;
@@ -104,9 +105,10 @@ use crate::{
     room::power_levels::{RoomPowerLevelChanges, RoomPowerLevelsExt},
     sync::RoomUpdate,
     utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
-    BaseRoom, Client, Error, HttpError, HttpResult, Result, RoomState, TransmissionProgress,
+    BaseRoom, Client, Error, HttpResult, Result, RoomState, TransmissionProgress,
 };
 
+pub mod edit;
 pub mod futures;
 mod member;
 mod messages;
@@ -377,9 +379,10 @@ impl Room {
             }
         }
 
-        let push_actions = self.event_push_actions(&event).await?;
+        let mut event = TimelineEvent::new(event);
+        event.push_actions = self.event_push_actions(&event.event).await?;
 
-        Ok(TimelineEvent { event, encryption_info: None, push_actions })
+        Ok(event)
     }
 
     /// Fetch the event with the given `EventId` in this room.
@@ -494,7 +497,7 @@ impl Room {
                 changes.add_room(room_info.clone());
 
                 self.client.store().save_changes(&changes).await?;
-                self.set_room_info(room_info, false);
+                self.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
 
                 Ok(())
             })
@@ -607,7 +610,7 @@ impl Room {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user that should be fetched out of the
-    /// store.
+    ///   store.
     pub async fn get_member(&self, user_id: &UserId) -> Result<Option<RoomMember>> {
         self.sync_members().await?;
         self.get_member_no_sync(user_id).await
@@ -625,7 +628,7 @@ impl Room {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user that should be fetched out of the
-    /// store.
+    ///   store.
     pub async fn get_member_no_sync(&self, user_id: &UserId) -> Result<Option<RoomMember>> {
         Ok(self
             .inner
@@ -983,15 +986,15 @@ impl Room {
         &self,
         tag: TagName,
         tag_info: TagInfo,
-    ) -> HttpResult<create_tag::v3::Response> {
-        let user_id = self.client.user_id().ok_or(HttpError::AuthenticationRequired)?;
+    ) -> Result<create_tag::v3::Response> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request = create_tag::v3::Request::new(
             user_id.to_owned(),
             self.inner.room_id().to_owned(),
             tag.to_string(),
             tag_info,
         );
-        self.client.send(request, None).await
+        Ok(self.client.send(request, None).await?)
     }
 
     /// Removes a tag from the room.
@@ -1000,14 +1003,14 @@ impl Room {
     ///
     /// # Arguments
     /// * `tag` - The tag to remove.
-    pub async fn remove_tag(&self, tag: TagName) -> HttpResult<delete_tag::v3::Response> {
-        let user_id = self.client.user_id().ok_or(HttpError::AuthenticationRequired)?;
+    pub async fn remove_tag(&self, tag: TagName) -> Result<delete_tag::v3::Response> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request = delete_tag::v3::Request::new(
             user_id.to_owned(),
             self.inner.room_id().to_owned(),
             tag.to_string(),
         );
-        self.client.send(request, None).await
+        Ok(self.client.send(request, None).await?)
     }
 
     /// Add or remove the `m.favourite` flag for this room.
@@ -1071,8 +1074,7 @@ impl Room {
     /// # Arguments
     /// * `is_direct` - Whether to mark this room as direct.
     pub async fn set_is_direct(&self, is_direct: bool) -> Result<()> {
-        let user_id =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let mut content = self
             .client
@@ -1121,8 +1123,6 @@ impl Room {
         &self,
         event: &Raw<OriginalSyncRoomEncryptedEvent>,
     ) -> Result<TimelineEvent> {
-        use ruma::events::room::encrypted::EncryptedEventScheme;
-
         let machine = self.client.olm_machine().await;
         let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
@@ -1130,13 +1130,10 @@ impl Room {
             match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
                 Ok(event) => event,
                 Err(e) => {
-                    let event = event.deserialize()?;
-                    if let EncryptedEventScheme::MegolmV1AesSha2(c) = event.content.scheme {
-                        self.client
-                            .encryption()
-                            .backups()
-                            .maybe_download_room_key(self.room_id().to_owned(), c.session_id);
-                    }
+                    self.client
+                        .encryption()
+                        .backups()
+                        .maybe_download_room_key(self.room_id().to_owned(), event.clone());
 
                     return Err(e.into());
                 }
@@ -1233,6 +1230,11 @@ impl Room {
         let request = invite_user::v3::Request::new(self.room_id().to_owned(), recipient);
         self.client.send(request, None).await?;
 
+        // Force a future room members reload before sending any event to prevent UTDs
+        // that can happen when some event is sent after a room member has been invited
+        // but before the /sync request could fetch the membership change event.
+        self.mark_members_missing();
+
         Ok(())
     }
 
@@ -1246,6 +1248,11 @@ impl Room {
         let recipient = InvitationRecipient::ThirdPartyId(invite_id);
         let request = invite_user::v3::Request::new(self.room_id().to_owned(), recipient);
         self.client.send(request, None).await?;
+
+        // Force a future room members reload before sending any event to prevent UTDs
+        // that can happen when some event is sent after a room member has been invited
+        // but before the /sync request could fetch the membership change event.
+        self.mark_members_missing();
 
         Ok(())
     }
@@ -1691,12 +1698,14 @@ impl Room {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    #[instrument(skip_all, fields(event_type, room_id = ?self.room_id(), transaction_id, encrypted, event_id))]
+    #[instrument(skip_all, fields(event_type, room_id = ?self.room_id(), transaction_id, is_room_encrypted, event_id))]
     pub fn send_raw<'a>(
         &'a self,
         event_type: &'a str,
         content: impl IntoRawMessageLikeEventContent,
     ) -> SendRawMessageLikeEvent<'a> {
+        // Note: the recorded instrument fields are saved in
+        // `SendRawMessageLikeEvent::into_future`.
         SendRawMessageLikeEvent::new(self, event_type, content)
     }
 
@@ -1773,10 +1782,10 @@ impl Room {
     /// * `filename` - The file name.
     ///
     /// * `content_type` - The type of the media, this will be used as the
-    /// content-type header.
+    ///   content-type header.
     ///
     /// * `reader` - A `Reader` that will be used to fetch the raw bytes of the
-    /// media.
+    ///   media.
     ///
     /// * `config` - Metadata and configuration for the attachment.
     pub(super) async fn prepare_and_send_attachment<'a>(
@@ -1956,8 +1965,8 @@ impl Room {
     /// # Arguments
     /// * `mime` - The mime type describing the data
     /// * `data` - The data representation of the avatar
-    /// * `info` - The optional image info provided for the avatar,
-    /// the blurhash and the mimetype will always be updated
+    /// * `info` - The optional image info provided for the avatar, the blurhash
+    ///   and the mimetype will always be updated
     pub async fn upload_avatar(
         &self,
         mime: &Mime,
@@ -2602,8 +2611,7 @@ impl Room {
     /// Set a flag on the room to indicate that the user has explicitly marked
     /// it as (un)read.
     pub async fn set_unread_flag(&self, unread: bool) -> Result<()> {
-        let user_id =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let content = MarkedUnreadEventContent::new(unread);
 
@@ -2636,6 +2644,7 @@ impl Room {
     /// This function is supposed to be called whenever the user creates a room
     /// call. It will send a `m.call.notify` event if:
     ///  - there is not yet a running call.
+    ///
     /// It will configure the notify type: ring or notify based on:
     ///  - is this a DM room -> ring
     ///  - is this a group with more than one other member -> notify

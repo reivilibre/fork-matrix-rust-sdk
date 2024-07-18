@@ -133,7 +133,7 @@ impl ClientWrapper {
         sqlite_dir: Option<&Path>,
         app_identifier: Option<String>,
     ) -> Self {
-        let builder = TestClientBuilder::new(username).randomize_username();
+        let builder = TestClientBuilder::new(username);
 
         let builder = if let Some(sqlite_dir) = sqlite_dir {
             builder.use_sqlite_dir(sqlite_dir)
@@ -244,8 +244,7 @@ impl ClientWrapper {
             room.send(RoomMessageEventContent::text_plain(message.to_owned()))
                 .await
                 .expect("Sending message failed")
-                .event_id
-                .to_owned(),
+                .event_id,
             message.to_owned(),
         )
     }

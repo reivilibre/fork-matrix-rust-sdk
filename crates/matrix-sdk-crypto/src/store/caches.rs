@@ -27,11 +27,12 @@ use std::{
 };
 
 use ruma::{DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{field::display, instrument, trace, Span};
 
 use crate::{
-    identities::ReadOnlyDevice,
+    identities::DeviceData,
     olm::{InboundGroupSession, Session},
 };
 
@@ -139,7 +140,7 @@ impl GroupSessionStore {
 /// In-memory store holding the devices of users.
 #[derive(Debug, Default)]
 pub struct DeviceStore {
-    entries: StdRwLock<BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ReadOnlyDevice>>>,
+    entries: StdRwLock<BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, DeviceData>>>,
 }
 
 impl DeviceStore {
@@ -151,7 +152,7 @@ impl DeviceStore {
     /// Add a device to the store.
     ///
     /// Returns true if the device was already in the store, false otherwise.
-    pub fn add(&self, device: ReadOnlyDevice) -> bool {
+    pub fn add(&self, device: DeviceData) -> bool {
         let user_id = device.user_id();
         self.entries
             .write()
@@ -163,7 +164,7 @@ impl DeviceStore {
     }
 
     /// Get the device with the given device_id and belonging to the given user.
-    pub fn get(&self, user_id: &UserId, device_id: &DeviceId) -> Option<ReadOnlyDevice> {
+    pub fn get(&self, user_id: &UserId, device_id: &DeviceId) -> Option<DeviceData> {
         Some(self.entries.read().unwrap().get(user_id)?.get(device_id)?.clone())
     }
 
@@ -171,12 +172,12 @@ impl DeviceStore {
     /// user.
     ///
     /// Returns the device if it was removed, None if it wasn't in the store.
-    pub fn remove(&self, user_id: &UserId, device_id: &DeviceId) -> Option<ReadOnlyDevice> {
+    pub fn remove(&self, user_id: &UserId, device_id: &DeviceId) -> Option<DeviceData> {
         self.entries.write().unwrap().get_mut(user_id)?.remove(device_id)
     }
 
     /// Get a read-only view over all devices of the given user.
-    pub fn user_devices(&self, user_id: &UserId) -> HashMap<OwnedDeviceId, ReadOnlyDevice> {
+    pub fn user_devices(&self, user_id: &UserId) -> HashMap<OwnedDeviceId, DeviceData> {
         self.entries
             .write()
             .unwrap()
@@ -197,8 +198,9 @@ impl DeviceStore {
 /// subtraction. For example, suppose we've just overflowed from i64::MAX to
 /// i64::MIN. (i64::MAX.wrapping_sub(i64::MIN)) is -1, which tells us that
 /// i64::MAX comes before i64::MIN in the sequence.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SequenceNumber(i64);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct SequenceNumber(i64);
 
 impl Display for SequenceNumber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -219,7 +221,7 @@ impl Ord for SequenceNumber {
 }
 
 impl SequenceNumber {
-    fn increment(&mut self) {
+    pub(crate) fn increment(&mut self) {
         self.0 = self.0.wrapping_add(1)
     }
 
@@ -392,7 +394,7 @@ mod tests {
     use super::{DeviceStore, GroupSessionStore, SequenceNumber, SessionStore};
     use crate::{
         identities::device::testing::get_device,
-        olm::{tests::get_account_and_session_test_helper, InboundGroupSession},
+        olm::{tests::get_account_and_session_test_helper, InboundGroupSession, SenderData},
     };
 
     #[async_test]
@@ -445,6 +447,7 @@ mod tests {
             Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
             room_id,
             &outbound.session_key().await,
+            SenderData::unknown(),
             outbound.settings().algorithm.to_owned(),
             None,
         )

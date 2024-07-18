@@ -57,7 +57,7 @@ use super::{
     OutgoingContent,
 };
 use crate::{
-    identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
+    identities::{DeviceData, UserIdentityData},
     olm::StaticAccountData,
     verification::{
         cache::RequestInfo,
@@ -67,7 +67,7 @@ use crate::{
         },
         Cancelled, Emoji, FlowId,
     },
-    ReadOnlyOwnUserIdentity,
+    OwnUserIdentityData,
 };
 
 const KEY_AGREEMENT_PROTOCOLS: &[KeyAgreementProtocol] =
@@ -451,8 +451,8 @@ pub struct Confirmed {
 pub struct MacReceived {
     sas: Arc<Mutex<EstablishedSas>>,
     we_started: bool,
-    verified_devices: Arc<[ReadOnlyDevice]>,
-    verified_master_keys: Arc<[ReadOnlyUserIdentities]>,
+    verified_devices: Arc<[DeviceData]>,
+    verified_master_keys: Arc<[UserIdentityData]>,
     pub accepted_protocols: AcceptedProtocols,
 }
 
@@ -462,8 +462,8 @@ pub struct MacReceived {
 #[derive(Clone, Debug)]
 pub struct WaitingForDone {
     sas: Arc<Mutex<EstablishedSas>>,
-    verified_devices: Arc<[ReadOnlyDevice]>,
-    verified_master_keys: Arc<[ReadOnlyUserIdentities]>,
+    verified_devices: Arc<[DeviceData]>,
+    verified_master_keys: Arc<[UserIdentityData]>,
     pub accepted_protocols: AcceptedProtocols,
 }
 
@@ -475,8 +475,8 @@ pub struct WaitingForDone {
 #[derive(Clone, Debug)]
 pub struct Done {
     sas: Arc<Mutex<EstablishedSas>>,
-    verified_devices: Arc<[ReadOnlyDevice]>,
-    verified_master_keys: Arc<[ReadOnlyUserIdentities]>,
+    verified_devices: Arc<[DeviceData]>,
+    verified_master_keys: Arc<[UserIdentityData]>,
     pub accepted_protocols: AcceptedProtocols,
 }
 
@@ -493,7 +493,7 @@ impl<S: Clone> SasState<S> {
     }
 
     #[cfg(test)]
-    pub fn other_device(&self) -> ReadOnlyDevice {
+    pub fn other_device(&self) -> DeviceData {
         self.ids.other_device.clone()
     }
 
@@ -552,9 +552,9 @@ impl SasState<Created> {
     /// * `other_identity` - The identity of the other user if one exists.
     pub fn new(
         account: StaticAccountData,
-        other_device: ReadOnlyDevice,
-        own_identity: Option<ReadOnlyOwnUserIdentity>,
-        other_identity: Option<ReadOnlyUserIdentities>,
+        other_device: DeviceData,
+        own_identity: Option<OwnUserIdentityData>,
+        other_identity: Option<UserIdentityData>,
         flow_id: FlowId,
         started_from_request: bool,
         short_auth_strings: Option<Vec<ShortAuthenticationString>>,
@@ -573,9 +573,9 @@ impl SasState<Created> {
     fn new_helper(
         flow_id: FlowId,
         account: StaticAccountData,
-        other_device: ReadOnlyDevice,
-        own_identity: Option<ReadOnlyOwnUserIdentity>,
-        other_identity: Option<ReadOnlyUserIdentities>,
+        other_device: DeviceData,
+        own_identity: Option<OwnUserIdentityData>,
+        other_identity: Option<UserIdentityData>,
         started_from_request: bool,
         short_auth_strings: Option<Vec<ShortAuthenticationString>>,
     ) -> SasState<Created> {
@@ -624,7 +624,7 @@ impl SasState<Created> {
     /// # Arguments
     ///
     /// * `event` - The m.key.verification.accept event that was sent to us by
-    /// the other side.
+    ///   the other side.
     pub fn into_accepted(
         self,
         sender: &UserId,
@@ -672,12 +672,12 @@ impl SasState<Started> {
     /// * `other_device` - The other device which we are going to verify.
     ///
     /// * `event` - The m.key.verification.start event that was sent to us by
-    /// the other side.
+    ///   the other side.
     pub fn from_start_event(
         account: StaticAccountData,
-        other_device: ReadOnlyDevice,
-        own_identity: Option<ReadOnlyOwnUserIdentity>,
-        other_identity: Option<ReadOnlyUserIdentities>,
+        other_device: DeviceData,
+        own_identity: Option<OwnUserIdentityData>,
+        other_identity: Option<UserIdentityData>,
         flow_id: FlowId,
         content: &StartContent<'_>,
         started_from_request: bool,
@@ -825,7 +825,7 @@ impl SasState<Started> {
     /// # Arguments
     ///
     /// * `event` - The m.key.verification.accept event that was sent to us by
-    /// the other side.
+    ///   the other side.
     pub fn into_accepted(
         self,
         sender: &UserId,
@@ -905,9 +905,9 @@ impl SasState<WeAccepted> {
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.key event that was sent to us by
-    /// the other side. The event will be modified so it doesn't contain any key
-    /// anymore.
+    /// * `event` - The m.key.verification.key event that was sent to us by the
+    ///   other side. The event will be modified so it doesn't contain any key
+    ///   anymore.
     pub fn into_key_received(
         self,
         sender: &UserId,
@@ -940,9 +940,9 @@ impl SasState<Accepted> {
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.key event that was sent to us by
-    /// the other side. The event will be modified so it doesn't contain any key
-    /// anymore.
+    /// * `event` - The m.key.verification.key event that was sent to us by the
+    ///   other side. The event will be modified so it doesn't contain any key
+    ///   anymore.
     pub fn into_key_received(
         self,
         sender: &UserId,
@@ -1165,8 +1165,8 @@ impl SasState<KeysExchanged> {
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by
-    /// the other side.
+    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    ///   other side.
     pub fn into_mac_received(
         self,
         sender: &UserId,
@@ -1229,8 +1229,8 @@ impl SasState<Confirmed> {
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by
-    /// the other side.
+    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    ///   other side.
     pub fn into_done(
         self,
         sender: &UserId,
@@ -1273,8 +1273,8 @@ impl SasState<Confirmed> {
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by
-    /// the other side.
+    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    ///   other side.
     pub fn into_waiting_for_done(
         self,
         sender: &UserId,
@@ -1445,8 +1445,8 @@ impl SasState<WaitingForDone> {
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by
-    /// the other side.
+    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    ///   other side.
     pub fn into_done(
         self,
         sender: &UserId,
@@ -1488,12 +1488,12 @@ impl SasState<Done> {
     }
 
     /// Get the list of verified devices.
-    pub fn verified_devices(&self) -> Arc<[ReadOnlyDevice]> {
+    pub fn verified_devices(&self) -> Arc<[DeviceData]> {
         self.state.verified_devices.clone()
     }
 
     /// Get the list of verified identities.
-    pub fn verified_identities(&self) -> Arc<[ReadOnlyUserIdentities]> {
+    pub fn verified_identities(&self) -> Arc<[UserIdentityData]> {
         self.state.verified_master_keys.clone()
     }
 }
@@ -1529,7 +1529,7 @@ mod tests {
             event_enums::{AcceptContent, KeyContent, MacContent, StartContent},
             FlowId,
         },
-        AcceptedProtocols, Account, ReadOnlyDevice,
+        AcceptedProtocols, Account, DeviceData,
     };
 
     fn alice_id() -> &'static UserId {
@@ -1552,10 +1552,10 @@ mod tests {
         mac_method: Option<SupportedMacMethod>,
     ) -> (SasState<Created>, SasState<WeAccepted>) {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
-        let alice_device = ReadOnlyDevice::from_account(&alice);
+        let alice_device = DeviceData::from_account(&alice);
 
         let bob = Account::with_device_id(bob_id(), bob_device_id());
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
 
         let flow_id = TransactionId::new().into();
         let alice_sas = SasState::<Created>::new(
@@ -1825,10 +1825,10 @@ mod tests {
     #[async_test]
     async fn test_sas_from_start_unknown_method() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
-        let alice_device = ReadOnlyDevice::from_account(&alice);
+        let alice_device = DeviceData::from_account(&alice);
 
         let bob = Account::with_device_id(bob_id(), bob_device_id());
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
 
         let flow_id = TransactionId::new().into();
         let alice_sas = SasState::<Created>::new(

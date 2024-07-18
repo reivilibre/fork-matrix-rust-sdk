@@ -3,8 +3,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use matrix_sdk::{
     event_cache::paginator::PaginatorError,
-    room::{power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole},
-    ComposerDraft, RoomMemberships, RoomState,
+    room::{
+        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
+    },
+    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
+    RoomHero as SdkRoomHero, RoomMemberships, RoomState,
 };
 use matrix_sdk_ui::timeline::{PaginationError, RoomExt, TimelineFocus};
 use mime::Mime;
@@ -15,6 +18,7 @@ use ruma::{
         call::notify,
         room::{
             avatar::ImageInfo as RumaAvatarImageInfo,
+            message::RoomMessageEventContentWithoutRelation,
             power_levels::RoomPowerLevels as RumaPowerLevels, MediaSource,
         },
         TimelineEventType,
@@ -32,7 +36,7 @@ use crate::{
     room_info::RoomInfo,
     room_member::RoomMember,
     ruma::{ImageInfo, Mentions, NotifyType},
-    timeline::{EventTimelineItem, FocusEventError, ReceiptType, Timeline},
+    timeline::{FocusEventError, ReceiptType, Timeline},
     utils::u64_to_uint,
     TaskHandle,
 };
@@ -126,6 +130,11 @@ impl Room {
         self.inner.state().into()
     }
 
+    /// Returns the room heroes for this room.
+    pub fn heroes(&self) -> Vec<RoomHero> {
+        self.inner.heroes().into_iter().map(Into::into).collect()
+    }
+
     /// Is there a non expired membership with application "m.call" and scope
     /// "m.room" in this room.
     pub fn has_active_room_call(&self) -> bool {
@@ -134,7 +143,7 @@ impl Room {
 
     /// Returns a Vec of userId's that participate in the room call.
     ///
-    /// matrix_rtc memberships with application "m.call" and scope "m.room" are
+    /// MatrixRTC memberships with application "m.call" and scope "m.room" are
     /// considered. A user can occur twice if they join with two devices.
     /// convert to a set depending if the different users are required or the
     /// amount of sessions.
@@ -257,38 +266,7 @@ impl Room {
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        // Look for a local event in the `Timeline`.
-        //
-        // First off, let's see if a `Timeline` exists…
-        if let Some(timeline) = self.timeline.read().await.clone() {
-            // If it contains a `latest_event`…
-            if let Some(timeline_last_event) = timeline.inner.latest_event().await {
-                // If it's a local echo…
-                if timeline_last_event.is_local_echo() {
-                    return Ok(RoomInfo::new(
-                        &self.inner,
-                        Some(Arc::new(EventTimelineItem(timeline_last_event))),
-                    )
-                    .await?);
-                }
-            }
-        }
-
-        // Otherwise, create a synthetic [`EventTimelineItem`] using the classical
-        // [`Room`] path.
-        let latest_event = match self.inner.latest_event() {
-            Some(latest_event) => matrix_sdk_ui::timeline::EventTimelineItem::from_latest_event(
-                self.inner.client(),
-                self.inner.room_id(),
-                latest_event,
-            )
-            .await
-            .map(EventTimelineItem)
-            .map(Arc::new),
-            None => None,
-        };
-
-        Ok(RoomInfo::new(&self.inner, latest_event).await?)
+        Ok(RoomInfo::new(&self.inner).await?)
     }
 
     pub fn subscribe_to_room_info_updates(
@@ -332,8 +310,8 @@ impl Room {
     ///
     /// * `event_id` - The ID of the event to redact
     ///
-    /// * `reason` - The reason for the event being redacted (optional).
-    /// its transaction ID (optional). If not given one is created.
+    /// * `reason` - The reason for the event being redacted (optional). its
+    ///   transaction ID (optional). If not given one is created.
     pub async fn redact(
         &self,
         event_id: String,
@@ -651,6 +629,7 @@ impl Room {
     /// This function is supposed to be called whenever the user creates a room
     /// call. It will send a `m.call.notify` event if:
     ///  - there is not yet a running call.
+    ///
     /// It will configure the notify type: ring or notify based on:
     ///  - is this a DM room -> ring
     ///  - is this a group with more than one other member -> notify
@@ -702,17 +681,37 @@ impl Room {
     /// Store the given `ComposerDraft` in the state store using the current
     /// room id, as identifier.
     pub async fn save_composer_draft(&self, draft: ComposerDraft) -> Result<(), ClientError> {
-        Ok(self.inner.save_composer_draft(draft).await?)
+        Ok(self.inner.save_composer_draft(draft.try_into()?).await?)
     }
 
     /// Retrieve the `ComposerDraft` stored in the state store for this room.
     pub async fn load_composer_draft(&self) -> Result<Option<ComposerDraft>, ClientError> {
-        Ok(self.inner.load_composer_draft().await?)
+        Ok(self.inner.load_composer_draft().await?.map(Into::into))
     }
 
     /// Remove the `ComposerDraft` stored in the state store for this room.
     pub async fn clear_composer_draft(&self) -> Result<(), ClientError> {
         Ok(self.inner.clear_composer_draft().await?)
+    }
+
+    /// Edit an event given its event id.
+    ///
+    /// Useful outside the context of a timeline, or when a timeline doesn't
+    /// have the full content of an event.
+    pub async fn edit(
+        &self,
+        event_id: String,
+        new_content: Arc<RoomMessageEventContentWithoutRelation>,
+    ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+
+        let replacement_event = self
+            .inner
+            .make_edit_event(&event_id, EditedContent::RoomMessage((*new_content).clone()))
+            .await?;
+
+        self.inner.send(replacement_event).await?;
+        Ok(())
     }
 }
 
@@ -807,6 +806,27 @@ impl RoomMembersIterator {
     }
 }
 
+/// Information about a member considered to be a room hero.
+#[derive(uniffi::Record)]
+pub struct RoomHero {
+    /// The user ID of the hero.
+    user_id: String,
+    /// The display name of the hero.
+    display_name: Option<String>,
+    /// The avatar URL of the hero.
+    avatar_url: Option<String>,
+}
+
+impl From<SdkRoomHero> for RoomHero {
+    fn from(value: SdkRoomHero) -> Self {
+        Self {
+            user_id: value.user_id.to_string(),
+            display_name: value.display_name.clone(),
+            avatar_url: value.avatar_url.as_ref().map(ToString::to_string),
+        }
+    }
+}
+
 /// An update for a particular user's power level within the room.
 #[derive(uniffi::Record)]
 pub struct UserPowerLevelUpdate {
@@ -850,5 +870,74 @@ impl From<RtcApplicationType> for notify::ApplicationType {
         match value {
             RtcApplicationType::Call => notify::ApplicationType::Call,
         }
+    }
+}
+
+/// Current draft of the composer for the room.
+#[derive(uniffi::Record)]
+pub struct ComposerDraft {
+    /// The draft content in plain text.
+    pub plain_text: String,
+    /// If the message is formatted in HTML, the HTML representation of the
+    /// message.
+    pub html_text: Option<String>,
+    /// The type of draft.
+    pub draft_type: ComposerDraftType,
+}
+
+impl From<SdkComposerDraft> for ComposerDraft {
+    fn from(value: SdkComposerDraft) -> Self {
+        let SdkComposerDraft { plain_text, html_text, draft_type } = value;
+        Self { plain_text, html_text, draft_type: draft_type.into() }
+    }
+}
+
+impl TryFrom<ComposerDraft> for SdkComposerDraft {
+    type Error = ruma::IdParseError;
+
+    fn try_from(value: ComposerDraft) -> std::result::Result<Self, Self::Error> {
+        let ComposerDraft { plain_text, html_text, draft_type } = value;
+        Ok(Self { plain_text, html_text, draft_type: draft_type.try_into()? })
+    }
+}
+
+/// The type of draft of the composer.
+#[derive(uniffi::Enum)]
+pub enum ComposerDraftType {
+    /// The draft is a new message.
+    NewMessage,
+    /// The draft is a reply to an event.
+    Reply {
+        /// The ID of the event being replied to.
+        event_id: String,
+    },
+    /// The draft is an edit of an event.
+    Edit {
+        /// The ID of the event being edited.
+        event_id: String,
+    },
+}
+
+impl From<SdkComposerDraftType> for ComposerDraftType {
+    fn from(value: SdkComposerDraftType) -> Self {
+        match value {
+            SdkComposerDraftType::NewMessage => Self::NewMessage,
+            SdkComposerDraftType::Reply { event_id } => Self::Reply { event_id: event_id.into() },
+            SdkComposerDraftType::Edit { event_id } => Self::Edit { event_id: event_id.into() },
+        }
+    }
+}
+
+impl TryFrom<ComposerDraftType> for SdkComposerDraftType {
+    type Error = ruma::IdParseError;
+
+    fn try_from(value: ComposerDraftType) -> std::result::Result<Self, Self::Error> {
+        let draft_type = match value {
+            ComposerDraftType::NewMessage => Self::NewMessage,
+            ComposerDraftType::Reply { event_id } => Self::Reply { event_id: event_id.try_into()? },
+            ComposerDraftType::Edit { event_id } => Self::Edit { event_id: event_id.try_into()? },
+        };
+
+        Ok(draft_type)
     }
 }

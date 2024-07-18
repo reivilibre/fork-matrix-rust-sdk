@@ -5,9 +5,7 @@ use std::{
 
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Subcommand};
-use uniffi_bindgen::{
-    bindings::swift::gen_swift::SwiftBindingGenerator, library_mode::generate_bindings,
-};
+use uniffi_bindgen::{bindings::SwiftBindingGenerator, library_mode::generate_bindings};
 use xshell::{cmd, pushd};
 
 use crate::{workspace, Result};
@@ -98,13 +96,13 @@ impl Platform {
         }
     }
 
-    /// The name of the library for the platform once all architectures are
-    /// lipo'd together.
-    fn lib_name(&self) -> &str {
+    /// The name of the subfolder in which to place the library for the platform
+    /// once all architectures are lipo'd together.
+    fn lib_folder_name(&self) -> &str {
         match self {
-            Platform::Macos => "libmatrix_sdk_ffi_macos.a",
-            Platform::Ios => "libmatrix_sdk_ffi_ios.a",
-            Platform::IosSimulator => "libmatrix_sdk_ffi_iossimulator.a",
+            Platform::Macos => "macos",
+            Platform::Ios => "ios",
+            Platform::IosSimulator => "ios-simulator",
         }
     }
 }
@@ -183,9 +181,11 @@ fn build_xcframework(
     let _ = remove_dir_all(&generated_dir);
     create_dir_all(&generated_dir)?;
 
-    let headers_dir = generated_dir.join("ls");
+    let headers_dir = generated_dir.join("headers");
+    // Use a subdirectory to fix conflicts with other UniFFI libraries.
+    let headers_module_dir = headers_dir.join("MatrixSDKFFI");
     let swift_dir = generated_dir.join("swift");
-    create_dir_all(headers_dir.clone())?;
+    create_dir_all(headers_module_dir.clone())?;
     create_dir_all(swift_dir.clone())?;
 
     let targets = if let Some(triples) = targets {
@@ -206,8 +206,8 @@ fn build_xcframework(
     let uniffi_lib_path = platform_build_paths.values().next().unwrap().first().unwrap().clone();
     generate_uniffi(&uniffi_lib_path, &generated_dir)?;
 
-    move_files("h", &generated_dir, &headers_dir)?;
-    consolidate_modulemap_files(&generated_dir, &headers_dir)?;
+    move_files("h", &generated_dir, &headers_module_dir)?;
+    consolidate_modulemap_files(&generated_dir, &headers_module_dir)?;
 
     move_files("swift", &generated_dir, &swift_dir)?;
 
@@ -321,7 +321,10 @@ fn lipo_platform_libraries(
             continue;
         }
 
-        let output_path = generated_dir.join(platform.lib_name());
+        let output_folder = generated_dir.join("lipo").join(platform.lib_folder_name());
+        create_dir_all(&output_folder)?;
+
+        let output_path = output_folder.join(FFI_LIBRARY_NAME);
         let mut cmd = cmd!("lipo -create");
         for path in paths {
             cmd = cmd.arg(path);

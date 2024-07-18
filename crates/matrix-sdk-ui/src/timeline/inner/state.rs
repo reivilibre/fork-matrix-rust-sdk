@@ -16,7 +16,7 @@ use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use eyeball_im::{ObservableVector, ObservableVectorTransaction, ObservableVectorTransactionEntry};
 use indexmap::IndexMap;
-use matrix_sdk::{deserialized_responses::SyncTimelineEvent, send_queue::AbortSendHandle};
+use matrix_sdk::{deserialized_responses::SyncTimelineEvent, send_queue::SendHandle};
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
@@ -38,7 +38,7 @@ use crate::{
             Flow, HandleEventResult, TimelineEventContext, TimelineEventHandler, TimelineEventKind,
             TimelineItemPosition,
         },
-        event_item::{EventItemIdentifier, RemoteEventOrigin},
+        event_item::{RemoteEventOrigin, TimelineEventItemId},
         polls::PollPendingEvents,
         reactions::{ReactionToggleResult, Reactions},
         read_receipts::ReadReceipts,
@@ -163,7 +163,7 @@ impl TimelineInnerState {
         own_user_id: OwnedUserId,
         own_profile: Option<Profile>,
         txn_id: OwnedTransactionId,
-        abort_handle: Option<AbortSendHandle>,
+        send_handle: Option<SendHandle>,
         content: TimelineEventKind,
     ) {
         let ctx = TimelineEventContext {
@@ -171,12 +171,10 @@ impl TimelineInnerState {
             sender_profile: own_profile,
             timestamp: MilliSecondsSinceUnixEpoch::now(),
             is_own_event: true,
-            // FIXME: Should we supply something here for encrypted rooms?
-            encryption_info: None,
             read_receipts: Default::default(),
             // An event sent by ourself is never matched against push rules.
             is_highlighted: false,
-            flow: Flow::Local { txn_id, abort_handle },
+            flow: Flow::Local { txn_id, send_handle },
         };
 
         let mut txn = self.transaction();
@@ -294,7 +292,7 @@ impl TimelineInnerState {
 
             // Remove the local echo from the related event.
             if let Some(txn_id) = local_echo_to_remove {
-                let id = EventItemIdentifier::TransactionId(txn_id.clone());
+                let id = TimelineEventItemId::TransactionId(txn_id.clone());
                 if reaction_group.0.swap_remove(&id).is_none() {
                     warn!(
                         "Tried to remove reaction by transaction ID, but didn't \
@@ -306,7 +304,7 @@ impl TimelineInnerState {
             // Add the remote echo to the related event
             if let Some(event_id) = remote_echo_to_add {
                 reaction_group.0.insert(
-                    EventItemIdentifier::EventId(event_id.clone()),
+                    TimelineEventItemId::EventId(event_id.clone()),
                     reaction_sender_data.clone(),
                 );
             };
@@ -324,7 +322,7 @@ impl TimelineInnerState {
             // Remove the local echo from reaction_map
             // (should the local echo already be up-to-date after event handling?)
             if let Some(txn_id) = local_echo_to_remove {
-                let id = EventItemIdentifier::TransactionId(txn_id.clone());
+                let id = TimelineEventItemId::TransactionId(txn_id.clone());
                 if self.meta.reactions.map.remove(&id).is_none() {
                     warn!(
                         "Tried to remove reaction by transaction ID, but didn't \
@@ -335,7 +333,7 @@ impl TimelineInnerState {
             // Add the remote echo to the reaction_map
             if let Some(event_id) = remote_echo_to_add {
                 self.meta.reactions.map.insert(
-                    EventItemIdentifier::EventId(event_id.clone()),
+                    TimelineEventItemId::EventId(event_id.clone()),
                     (reaction_sender_data, annotation.clone()),
                 );
             }
@@ -345,12 +343,6 @@ impl TimelineInnerState {
         self.items.set(idx, item);
 
         Ok(())
-    }
-
-    pub(super) fn set_fully_read_event(&mut self, fully_read_event_id: OwnedEventId) {
-        let mut txn = self.transaction();
-        txn.set_fully_read_event(fully_read_event_id);
-        txn.commit();
     }
 
     #[cfg(test)]
@@ -501,7 +493,9 @@ impl TimelineInnerStateTransaction<'_> {
                         timestamp: Some(event.origin_server_ts()),
                         visible: false,
                     };
-                    self.add_event(event_meta, position, room_data_provider, settings).await;
+                    let _event_added_or_updated = self
+                        .add_or_update_event(event_meta, position, room_data_provider, settings)
+                        .await;
 
                     return HandleEventResult::default();
                 }
@@ -526,7 +520,9 @@ impl TimelineInnerStateTransaction<'_> {
                             timestamp,
                             visible: false,
                         };
-                        self.add_event(event_meta, position, room_data_provider, settings).await;
+                        let _event_added_or_updated = self
+                            .add_or_update_event(event_meta, position, room_data_provider, settings)
+                            .await;
                     }
 
                     return HandleEventResult::default();
@@ -543,7 +539,15 @@ impl TimelineInnerStateTransaction<'_> {
             timestamp: Some(timestamp),
             visible: should_add,
         };
-        self.add_event(event_meta, position, room_data_provider, settings).await;
+
+        let event_added_or_updated =
+            self.add_or_update_event(event_meta, position, room_data_provider, settings).await;
+
+        // If the event has not been added or updated, it's because it's a duplicated
+        // event. Let's return early.
+        if !event_added_or_updated {
+            return HandleEventResult::default();
+        }
 
         let sender_profile = room_data_provider.profile_from_user_id(&sender).await;
         let ctx = TimelineEventContext {
@@ -551,7 +555,6 @@ impl TimelineInnerStateTransaction<'_> {
             sender_profile,
             timestamp,
             is_own_event,
-            encryption_info: event.encryption_info,
             read_receipts: if settings.track_read_receipts && should_add {
                 self.meta.read_receipts.compute_event_receipts(
                     &event_id,
@@ -565,6 +568,7 @@ impl TimelineInnerStateTransaction<'_> {
             flow: Flow::Remote {
                 event_id: event_id.clone(),
                 raw_event: raw.clone(),
+                encryption_info: event.encryption_info,
                 txn_id,
                 position,
                 should_add,
@@ -637,27 +641,50 @@ impl TimelineInnerStateTransaction<'_> {
         items.commit();
     }
 
-    async fn add_event<P: RoomDataProvider>(
+    /// Add or update an event in the [`TimelineInnerMeta::all_events`]
+    /// collection.
+    ///
+    /// This method also adjusts read receipt if needed.
+    ///
+    /// It returns `true` if the event has been added or updated, `false`
+    /// otherwise. The latter happens if the event already exists, i.e. if
+    /// an existing event is requested to be added.
+    async fn add_or_update_event<P: RoomDataProvider>(
         &mut self,
         event_meta: FullEventMeta<'_>,
         position: TimelineItemPosition,
         room_data_provider: &P,
         settings: &TimelineInnerSettings,
-    ) {
+    ) -> bool {
+        // Detect if an event already exists in [`TimelineInnerMeta::all_events`].
+        //
+        // Returns its position, in this case.
+        fn event_already_exists(
+            new_event_id: &EventId,
+            all_events: &VecDeque<EventMeta>,
+        ) -> Option<usize> {
+            all_events.iter().position(|EventMeta { event_id, .. }| event_id == new_event_id)
+        }
+
         match position {
             TimelineItemPosition::Start { .. } => {
+                if let Some(pos) = event_already_exists(event_meta.event_id, &self.meta.all_events)
+                {
+                    self.meta.all_events.remove(pos);
+                }
+
                 self.meta.all_events.push_front(event_meta.base_meta())
             }
+
             TimelineItemPosition::End { .. } => {
-                // Handle duplicated event.
-                if let Some(pos) =
-                    self.meta.all_events.iter().position(|ev| ev.event_id == event_meta.event_id)
+                if let Some(pos) = event_already_exists(event_meta.event_id, &self.meta.all_events)
                 {
                     self.meta.all_events.remove(pos);
                 }
 
                 self.meta.all_events.push_back(event_meta.base_meta());
             }
+
             #[cfg(feature = "e2e-encryption")]
             TimelineItemPosition::Update(_) => {
                 if let Some(event) =
@@ -686,6 +713,8 @@ impl TimelineInnerStateTransaction<'_> {
 
             self.maybe_add_implicit_read_receipt(event_meta);
         }
+
+        true
     }
 
     fn adjust_day_dividers(&mut self, mut adjuster: DayDividerAdjuster) {
@@ -839,7 +868,11 @@ impl TimelineInnerMetadata {
 
             (Some(from), Some(to)) => {
                 if from >= to {
-                    // The read marker can't move backwards. Keep the current one.
+                    // The read marker can't move backwards.
+                    if from + 1 == items.len() {
+                        // The read marker has nothing after it. An item disappeared; remove it.
+                        items.remove(from);
+                    }
                     self.has_up_to_date_read_marker_item = true;
                     return;
                 }
