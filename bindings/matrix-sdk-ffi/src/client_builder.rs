@@ -12,7 +12,6 @@ use matrix_sdk::{
 };
 use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
-use url::Url;
 use zeroize::Zeroizing;
 
 use super::{client::Client, RUNTIME};
@@ -258,6 +257,7 @@ pub struct ClientBuilder {
     cross_process_refresh_lock_id: Option<String>,
     session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
     additional_root_certificates: Vec<Vec<u8>>,
+    disable_built_in_root_certificates: bool,
     encryption_settings: EncryptionSettings,
 }
 
@@ -281,6 +281,7 @@ impl ClientBuilder {
             cross_process_refresh_lock_id: None,
             session_delegate: None,
             additional_root_certificates: Default::default(),
+            disable_built_in_root_certificates: false,
             encryption_settings: EncryptionSettings {
                 auto_enable_cross_signing: false,
                 backup_download_strategy:
@@ -403,6 +404,15 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
+    /// Don't trust any system root certificates, only trust the certificates
+    /// provided through
+    /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
+    pub fn disable_built_in_root_certificates(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.disable_built_in_root_certificates = true;
+        Arc::new(builder)
+    }
+
     pub fn auto_enable_cross_signing(
         self: Arc<Self>,
         auto_enable_cross_signing: bool,
@@ -477,18 +487,26 @@ impl ClientBuilder {
         for certificate in builder.additional_root_certificates {
             // We don't really know what type of certificate we may get here, so let's try
             // first one type, then the other.
-            if let Ok(cert) = Certificate::from_der(&certificate) {
-                certificates.push(cert);
-            } else {
-                let cert =
-                    Certificate::from_pem(&certificate).map_err(|e| ClientBuildError::Generic {
-                        message: format!("Failed to add a root certificate {e:?}"),
+            match Certificate::from_der(&certificate) {
+                Ok(cert) => {
+                    certificates.push(cert);
+                }
+                Err(der_error) => {
+                    let cert = Certificate::from_pem(&certificate).map_err(|pem_error| {
+                        ClientBuildError::Generic {
+                            message: format!("Failed to add a root certificate as DER ({der_error:?}) or PEM ({pem_error:?})"),
+                        }
                     })?;
-                certificates.push(cert);
+                    certificates.push(cert);
+                }
             }
         }
 
         inner_builder = inner_builder.add_root_certificates(certificates);
+
+        if builder.disable_built_in_root_certificates {
+            inner_builder = inner_builder.disable_built_in_root_certificates();
+        }
 
         if let Some(proxy) = builder.proxy {
             inner_builder = inner_builder.proxy(proxy);
@@ -508,6 +526,10 @@ impl ClientBuilder {
 
         inner_builder = inner_builder.with_encryption_settings(builder.encryption_settings);
 
+        if let Some(sliding_sync_proxy) = builder.sliding_sync_proxy {
+            inner_builder = inner_builder.sliding_sync_proxy(sliding_sync_proxy);
+        }
+
         inner_builder =
             inner_builder.simplified_sliding_sync(builder.is_simplified_sliding_sync_enabled);
 
@@ -516,23 +538,6 @@ impl ClientBuilder {
         }
 
         let sdk_client = inner_builder.build().await?;
-
-        // At this point, `sdk_client` might contain a `sliding_sync_proxy` that has
-        // been configured by the homeserver (if it's a `ServerName` and the
-        // `.well-known` file is filled as expected).
-        //
-        // If `builder.sliding_sync_proxy` contains `Some(_)`, it means one wants to
-        // overwrite this value. It would be an error to call
-        // `sdk_client.set_sliding_sync_proxy()` with `None`, as it would erase the
-        // `sliding_sync_proxy` if any, and it's not the intended behavior.
-        //
-        // So let's call `sdk_client.set_sliding_sync_proxy()` if and only if there is
-        // `Some(_)` value in `builder.sliding_sync_proxy`. That's really important: It
-        // might not break an existing app session, but it is likely to break a new
-        // session, which not immediate to detect if there is no test.
-        if let Some(sliding_sync_proxy) = builder.sliding_sync_proxy {
-            sdk_client.set_sliding_sync_proxy(Some(Url::parse(&sliding_sync_proxy)?));
-        }
 
         Ok(Arc::new(
             Client::new(

@@ -124,6 +124,7 @@ pub(crate) struct HttpSettings {
     pub(crate) user_agent: Option<String>,
     pub(crate) timeout: Duration,
     pub(crate) additional_root_certificates: Vec<Certificate>,
+    pub(crate) disable_built_in_root_certificates: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -135,6 +136,7 @@ impl Default for HttpSettings {
             user_agent: None,
             timeout: DEFAULT_REQUEST_TIMEOUT,
             additional_root_certificates: Default::default(),
+            disable_built_in_root_certificates: false,
         }
     }
 }
@@ -161,6 +163,11 @@ impl HttpSettings {
             for cert in &self.additional_root_certificates {
                 http_client = http_client.add_root_certificate(cert.clone());
             }
+        }
+
+        if self.disable_built_in_root_certificates {
+            info!("Built-in root certificates disabled in the HTTP client.");
+            http_client = http_client.tls_built_in_root_certs(false);
         }
 
         if let Some(p) = &self.proxy {
