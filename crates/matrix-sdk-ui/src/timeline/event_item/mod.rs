@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
 
 use as_variant::as_variant;
 use indexmap::IndexMap;
@@ -21,7 +24,10 @@ use matrix_sdk::{
     send_queue::SendHandle,
     Client, Error,
 };
-use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent};
+use matrix_sdk_base::{
+    deserialized_responses::{ShieldStateCode, SyncTimelineEvent, SENT_IN_CLEAR},
+    latest_event::LatestEvent,
+};
 use once_cell::sync::Lazy;
 use ruma::{
     events::{receipt::Receipt, room::message::MessageType, AnySyncTimelineEvent},
@@ -33,17 +39,15 @@ use tracing::warn;
 
 mod content;
 mod local;
-mod reactions;
 mod remote;
 
 pub use self::{
     content::{
         AnyOtherFullStateEventContent, EncryptedMessage, InReplyToDetails, MemberProfileChange,
-        MembershipChange, Message, OtherState, RepliedToEvent, RoomMembershipChange, Sticker,
-        TimelineItemContent,
+        MembershipChange, Message, OtherState, RepliedToEvent, RoomMembershipChange,
+        RoomPinnedEventsChange, Sticker, TimelineItemContent,
     },
     local::EventSendState,
-    reactions::{BundledReactions, ReactionGroup},
 };
 pub(super) use self::{
     local::LocalEventTimelineItem,
@@ -68,6 +72,11 @@ pub struct EventTimelineItem {
     pub(super) content: TimelineItemContent,
     /// The kind of event timeline item, local or remote.
     pub(super) kind: EventTimelineItemKind,
+    /// Whether or not the event belongs to an encrypted room.
+    ///
+    /// When `None` it is unknown if the room is encrypted and the item won't
+    /// return a ShieldState.
+    pub(super) is_room_encrypted: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,17 +114,28 @@ impl EventTimelineItem {
         timestamp: MilliSecondsSinceUnixEpoch,
         content: TimelineItemContent,
         kind: EventTimelineItemKind,
+        is_room_encrypted: bool,
     ) -> Self {
-        Self { sender, sender_profile, timestamp, content, kind }
+        let is_room_encrypted = Some(is_room_encrypted);
+        Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted }
     }
 
     /// If the supplied low-level `SyncTimelineEvent` is suitable for use as the
     /// `latest_event` in a message preview, wrap it as an `EventTimelineItem`.
+    ///
+    /// **Note:** Timeline items created via this constructor do **not** produce
+    /// the correct ShieldState when calling
+    /// [`get_shield`][EventTimelineItem::get_shield]. This is because they are
+    /// intended for display in the room list which a) is unlikely to show
+    /// shields and b) would incur a significant performance overhead.
     pub async fn from_latest_event(
         client: Client,
         room_id: &RoomId,
         latest_event: LatestEvent,
     ) -> Option<EventTimelineItem> {
+        // TODO: We shouldn't be returning an EventTimelineItem here because we're
+        // starting to diverge on what kind of data we need. The note above is a
+        // potential footgun which could one day turn into a security issue.
         use super::traits::RoomDataProvider;
 
         let SyncTimelineEvent { event: raw_sync_event, encryption_info, .. } =
@@ -133,11 +153,11 @@ impl EventTimelineItem {
 
         // If we don't (yet) know how to handle this type of message, return `None`
         // here. If we do, convert it into a `TimelineItemContent`.
-        let item_content = TimelineItemContent::from_latest_event_content(event)?;
+        let content = TimelineItemContent::from_latest_event_content(event)?;
 
         // We don't currently bundle any reactions with the main event. This could
         // conceivably be wanted in the message preview in future.
-        let reactions = IndexMap::new();
+        let reactions = ReactionsByKeyBySender::default();
 
         // The message preview probably never needs read receipts.
         let read_receipts = IndexMap::new();
@@ -152,7 +172,7 @@ impl EventTimelineItem {
         // Probably the origin of the event doesn't matter for the preview.
         let origin = RemoteEventOrigin::Sync;
 
-        let event_kind = RemoteEventTimelineItem {
+        let kind = RemoteEventTimelineItem {
             event_id,
             transaction_id: None,
             reactions,
@@ -168,7 +188,7 @@ impl EventTimelineItem {
 
         let room = client.get_room(room_id);
         let sender_profile = if let Some(room) = room {
-            let mut profile = room.profile_from_latest_event(&latest_event).await;
+            let mut profile = room.profile_from_latest_event(&latest_event);
 
             // Fallback to the slow path.
             if profile.is_none() {
@@ -179,8 +199,9 @@ impl EventTimelineItem {
         } else {
             TimelineDetails::Unavailable
         };
+        let is_room_encrypted = None;
 
-        Some(Self::new(sender, sender_profile, timestamp, item_content, event_kind))
+        Some(Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted })
     }
 
     /// Check whether this item is a local echo.
@@ -269,9 +290,9 @@ impl EventTimelineItem {
     }
 
     /// Get the reactions of this item.
-    pub fn reactions(&self) -> &BundledReactions {
+    pub fn reactions(&self) -> &ReactionsByKeyBySender {
         // There's not much of a point in allowing reactions to local echoes.
-        static EMPTY_REACTIONS: Lazy<BundledReactions> = Lazy::new(Default::default);
+        static EMPTY_REACTIONS: Lazy<ReactionsByKeyBySender> = Lazy::new(Default::default);
         match &self.kind {
             EventTimelineItemKind::Local(_) => &EMPTY_REACTIONS,
             EventTimelineItemKind::Remote(remote_event) => &remote_event.reactions,
@@ -352,13 +373,23 @@ impl EventTimelineItem {
     /// Gets the [`ShieldState`] which can be used to decorate messages in the
     /// recommended way.
     pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
-        self.encryption_info().map(|info| {
-            if strict {
-                info.verification_state.to_shield_state_strict()
-            } else {
-                info.verification_state.to_shield_state_lax()
+        if self.is_room_encrypted != Some(true) || self.is_local_echo() {
+            return None;
+        }
+
+        match self.encryption_info() {
+            Some(info) => {
+                if strict {
+                    Some(info.verification_state.to_shield_state_strict())
+                } else {
+                    Some(info.verification_state.to_shield_state_lax())
+                }
             }
-        })
+            None => Some(ShieldState::Red {
+                code: ShieldStateCode::SentInClear,
+                message: SENT_IN_CLEAR,
+            }),
+        }
     }
 
     /// Check whether this item can be replied to.
@@ -458,6 +489,7 @@ impl EventTimelineItem {
             timestamp: self.timestamp,
             content,
             kind,
+            is_room_encrypted: self.is_room_encrypted,
         }
     }
 
@@ -578,6 +610,70 @@ pub enum EventItemOrigin {
     Sync,
     /// The event came from pagination.
     Pagination,
+}
+
+/// What's the status of a reaction?
+#[derive(Clone, Debug)]
+pub enum ReactionStatus {
+    /// It's a local reaction to a remote event.
+    ///
+    /// The handle is missing only in testing contexts.
+    LocalToRemote(Option<SendHandle>),
+    /// It's a remote reaction to a remote event.
+    RemoteToRemote(OwnedEventId),
+}
+
+/// Information about a single reaction stored in [`ReactionsByKeyBySender`].
+#[derive(Clone, Debug)]
+pub struct ReactionInfo {
+    pub timestamp: MilliSecondsSinceUnixEpoch,
+    /// Current status of this reaction.
+    pub status: ReactionStatus,
+}
+
+/// Reactions grouped by key first, then by sender.
+///
+/// This representation makes sure that a given sender has sent at most one
+/// reaction for an event.
+#[derive(Debug, Clone, Default)]
+pub struct ReactionsByKeyBySender(IndexMap<String, IndexMap<OwnedUserId, ReactionInfo>>);
+
+impl Deref for ReactionsByKeyBySender {
+    type Target = IndexMap<String, IndexMap<OwnedUserId, ReactionInfo>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ReactionsByKeyBySender {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl ReactionsByKeyBySender {
+    /// Removes (in place) a reaction from the sender with the given annotation
+    /// from the mapping.
+    ///
+    /// Returns true if the reaction was found and thus removed, false
+    /// otherwise.
+    pub(crate) fn remove_reaction(
+        &mut self,
+        sender: &UserId,
+        annotation: &str,
+    ) -> Option<ReactionInfo> {
+        if let Some(by_user) = self.0.get_mut(annotation) {
+            if let Some(info) = by_user.swap_remove(sender) {
+                // If this was the last reaction, remove the annotation entry.
+                if by_user.is_empty() {
+                    self.0.swap_remove(annotation);
+                }
+                return Some(info);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

@@ -14,32 +14,48 @@
 
 use std::collections::HashMap;
 
-use indexmap::IndexSet;
-use ruma::{
-    events::relation::Annotation, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId,
-    OwnedUserId,
-};
+use indexmap::IndexMap;
+use ruma::{events::relation::Annotation, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId};
 
 use super::event_item::TimelineEventItemId;
 
-/// Data associated with a reaction sender. It can be used to display
-/// a details UI component for a reaction with both sender
-/// names and the date at which they sent a reaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReactionSenderData {
+// Implements hash etc
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+pub(super) struct AnnotationKey {
+    event_id: OwnedEventId,
+    key: String,
+}
+
+impl From<&Annotation> for AnnotationKey {
+    fn from(annotation: &Annotation) -> Self {
+        Self { event_id: annotation.event_id.clone(), key: annotation.key.clone() }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingReaction {
+    /// The annotation used for the reaction.
+    pub key: String,
     /// Sender identifier.
     pub sender_id: OwnedUserId,
     /// Date at which the sender reacted.
     pub timestamp: MilliSecondsSinceUnixEpoch,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FullReactionKey {
+    pub item: TimelineEventItemId,
+    pub key: String,
+    pub sender: OwnedUserId,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct Reactions {
-    /// Reaction event / txn ID => sender and reaction data.
-    pub(super) map: HashMap<TimelineEventItemId, (ReactionSenderData, Annotation)>,
-    /// ID of event that is not in the timeline yet => List of reaction event
-    /// IDs.
-    pub(super) pending: HashMap<OwnedEventId, IndexSet<OwnedEventId>>,
+    /// Reaction event / txn ID => full path to the reaction in some item.
+    pub map: HashMap<TimelineEventItemId, FullReactionKey>,
+    /// Mapping of events that are not in the timeline => reaction event id =>
+    /// pending reaction.
+    pub pending: HashMap<OwnedEventId, IndexMap<OwnedEventId, PendingReaction>>,
 }
 
 impl Reactions {
@@ -47,36 +63,4 @@ impl Reactions {
         self.map.clear();
         self.pending.clear();
     }
-}
-
-/// The result of toggling a reaction
-///
-/// Holds the data required to update the state of the reaction in the timeline
-#[derive(Clone, Debug)]
-pub(super) enum ReactionToggleResult {
-    /// Represents a successful reaction toggle which added a reaction
-    AddSuccess {
-        /// The event ID of the reaction which was added (the remote echo)
-        event_id: OwnedEventId,
-
-        /// The transaction ID of the reaction which was added (the local echo)
-        txn_id: OwnedTransactionId,
-    },
-
-    /// Represents a failed reaction toggle which did not add a reaction
-    AddFailure {
-        /// The transaction ID of the reaction which failed to be added (the
-        /// local echo)
-        txn_id: OwnedTransactionId,
-    },
-
-    /// Represents a successful reaction toggle which redacted a reaction
-    RedactSuccess,
-
-    /// Represents a failed reaction toggle which did not redact a reaction
-    RedactFailure {
-        /// The event ID of the reaction which failed to be redacted (the remote
-        /// echo)
-        event_id: OwnedEventId,
-    },
 }

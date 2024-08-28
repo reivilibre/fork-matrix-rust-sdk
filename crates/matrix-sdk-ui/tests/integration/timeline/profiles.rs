@@ -17,8 +17,8 @@ use std::{sync::Arc, time::Duration};
 use assert_matches::assert_matches;
 use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{
-    async_test, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder, ALICE, BOB, CAROL,
-    DEFAULT_TEST_ROOM_ID,
+    async_test, mocks::mock_encryption_state, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder,
+    ALICE, BOB, CAROL, DEFAULT_TEST_ROOM_ID,
 };
 use matrix_sdk_ui::timeline::{RoomExt, TimelineDetails};
 use ruma::events::room::{
@@ -45,6 +45,8 @@ async fn test_update_sender_profiles() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());

@@ -24,7 +24,8 @@ use matrix_sdk::{
     test_utils::{events::EventFactory, logged_in_client_with_server},
 };
 use matrix_sdk_test::{
-    async_test, sync_timeline_event, JoinedRoomBuilder, SyncResponseBuilder, ALICE, BOB,
+    async_test, mocks::mock_encryption_state, sync_timeline_event, JoinedRoomBuilder,
+    SyncResponseBuilder, ALICE, BOB,
 };
 use matrix_sdk_ui::{timeline::TimelineFocus, Timeline};
 use ruma::{event_id, events::room::message::RoomMessageEventContent, room_id};
@@ -67,6 +68,8 @@ async fn test_new_focused() {
         vec![],
     )
     .await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Timeline::builder(&room)
@@ -207,6 +210,8 @@ async fn test_focused_timeline_reacts() {
     )
     .await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = Timeline::builder(&room)
         .with_focus(TimelineFocus::Event {
@@ -301,6 +306,8 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
         vec![],
     )
     .await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Timeline::builder(&room)

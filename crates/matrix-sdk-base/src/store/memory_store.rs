@@ -14,13 +14,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    num::NonZeroUsize,
     sync::RwLock as StdRwLock,
 };
 
 use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloom;
-use matrix_sdk_common::{instant::Instant, ring_buffer::RingBuffer};
 use ruma::{
     canonical_json::{redact, RedactedBecause},
     events::{
@@ -31,26 +29,30 @@ use ruma::{
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    time::Instant,
+    CanonicalJsonObject, EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId,
+    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
 use tracing::{debug, instrument, trace, warn};
 
 use super::{
-    traits::{ComposerDraft, QueuedEvent, SerializableEventContent, ServerCapabilities},
-    Result, RoomInfo, StateChanges, StateStore, StoreError,
+    traits::{
+        ChildTransactionId, ComposerDraft, QueuedEvent, SerializableEventContent,
+        ServerCapabilities,
+    },
+    DependentQueuedEvent, DependentQueuedEventKind, Result, RoomInfo, StateChanges, StateStore,
+    StoreError,
 };
 use crate::{
-    deserialized_responses::RawAnySyncOrStrippedState,
-    media::{MediaRequest, UniqueKey as _},
-    MinimalRoomMemberEvent, RoomMemberships, RoomState, StateStoreDataKey, StateStoreDataValue,
+    deserialized_responses::RawAnySyncOrStrippedState, MinimalRoomMemberEvent, RoomMemberships,
+    RoomState, StateStoreDataKey, StateStoreDataValue,
 };
 
-/// In-Memory, non-persistent implementation of the `StateStore`
+/// In-memory, non-persistent implementation of the `StateStore`.
 ///
 /// Default if no other is configured at startup.
 #[allow(clippy::type_complexity)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MemoryStore {
     recently_visited_rooms: StdRwLock<HashMap<OwnedUserId, Vec<OwnedRoomId>>>,
     composer_drafts: StdRwLock<HashMap<OwnedRoomId, ComposerDraft>>,
@@ -87,41 +89,9 @@ pub struct MemoryStore {
             HashMap<(String, Option<String>), HashMap<OwnedEventId, HashMap<OwnedUserId, Receipt>>>,
         >,
     >,
-    media: StdRwLock<RingBuffer<(OwnedMxcUri, String /* unique key */, Vec<u8>)>>,
     custom: StdRwLock<HashMap<Vec<u8>, Vec<u8>>>,
     send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<QueuedEvent>>>,
-}
-
-// SAFETY: `new_unchecked` is safe because 20 is not zero.
-const NUMBER_OF_MEDIAS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20) };
-
-impl Default for MemoryStore {
-    fn default() -> Self {
-        Self {
-            recently_visited_rooms: Default::default(),
-            composer_drafts: Default::default(),
-            user_avatar_url: Default::default(),
-            sync_token: Default::default(),
-            server_capabilities: Default::default(),
-            filters: Default::default(),
-            utd_hook_manager_data: Default::default(),
-            account_data: Default::default(),
-            profiles: Default::default(),
-            display_names: Default::default(),
-            members: Default::default(),
-            room_info: Default::default(),
-            room_state: Default::default(),
-            room_account_data: Default::default(),
-            stripped_room_state: Default::default(),
-            stripped_members: Default::default(),
-            presence: Default::default(),
-            room_user_receipts: Default::default(),
-            room_event_receipts: Default::default(),
-            media: StdRwLock::new(RingBuffer::new(NUMBER_OF_MEDIAS)),
-            custom: Default::default(),
-            send_queue_events: Default::default(),
-        }
-    }
+    dependent_send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<DependentQueuedEvent>>>,
 }
 
 impl MemoryStore {
@@ -838,58 +808,6 @@ impl StateStore for MemoryStore {
         Ok(self.custom.write().unwrap().remove(key))
     }
 
-    async fn add_media_content(&self, request: &MediaRequest, data: Vec<u8>) -> Result<()> {
-        // Avoid duplication. Let's try to remove it first.
-        self.remove_media_content(request).await?;
-        // Now, let's add it.
-        self.media.write().unwrap().push((request.uri().to_owned(), request.unique_key(), data));
-
-        Ok(())
-    }
-
-    async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
-        let media = self.media.read().unwrap();
-        let expected_key = request.unique_key();
-
-        Ok(media.iter().find_map(|(_media_uri, media_key, media_content)| {
-            (media_key == &expected_key).then(|| media_content.to_owned())
-        }))
-    }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
-        let mut media = self.media.write().unwrap();
-        let expected_key = request.unique_key();
-        let Some(index) = media
-            .iter()
-            .position(|(_media_uri, media_key, _media_content)| media_key == &expected_key)
-        else {
-            return Ok(());
-        };
-
-        media.remove(index);
-
-        Ok(())
-    }
-
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<()> {
-        let mut media = self.media.write().unwrap();
-        let expected_key = uri.to_owned();
-        let positions = media
-            .iter()
-            .enumerate()
-            .filter_map(|(position, (media_uri, _media_key, _media_content))| {
-                (media_uri == &expected_key).then_some(position)
-            })
-            .collect::<Vec<_>>();
-
-        // Iterate in reverse-order so that positions stay valid after first removals.
-        for position in positions.into_iter().rev() {
-            media.remove(position);
-        }
-
-        Ok(())
-    }
-
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
         self.profiles.write().unwrap().remove(room_id);
         self.display_names.write().unwrap().remove(room_id);
@@ -996,6 +914,66 @@ impl StateStore for MemoryStore {
     async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
         Ok(self.send_queue_events.read().unwrap().keys().cloned().collect())
     }
+
+    async fn save_dependent_send_queue_event(
+        &self,
+        room: &RoomId,
+        parent_transaction_id: &TransactionId,
+        own_transaction_id: ChildTransactionId,
+        content: DependentQueuedEventKind,
+    ) -> Result<(), Self::Error> {
+        self.dependent_send_queue_events.write().unwrap().entry(room.to_owned()).or_default().push(
+            DependentQueuedEvent {
+                kind: content,
+                parent_transaction_id: parent_transaction_id.to_owned(),
+                own_transaction_id,
+                event_id: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn update_dependent_send_queue_event(
+        &self,
+        room: &RoomId,
+        parent_txn_id: &TransactionId,
+        event_id: OwnedEventId,
+    ) -> Result<usize, Self::Error> {
+        let mut dependent_send_queue_events = self.dependent_send_queue_events.write().unwrap();
+        let dependents = dependent_send_queue_events.entry(room.to_owned()).or_default();
+        let mut num_updated = 0;
+        for d in dependents.iter_mut().filter(|item| item.parent_transaction_id == parent_txn_id) {
+            d.event_id = Some(event_id.clone());
+            num_updated += 1;
+        }
+        Ok(num_updated)
+    }
+
+    async fn remove_dependent_send_queue_event(
+        &self,
+        room: &RoomId,
+        txn_id: &ChildTransactionId,
+    ) -> Result<bool, Self::Error> {
+        let mut dependent_send_queue_events = self.dependent_send_queue_events.write().unwrap();
+        let dependents = dependent_send_queue_events.entry(room.to_owned()).or_default();
+        if let Some(pos) = dependents.iter().position(|item| item.own_transaction_id == *txn_id) {
+            dependents.remove(pos);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List all the dependent send queue events.
+    ///
+    /// This returns absolutely all the dependent send queue events, whether
+    /// they have an event id or not.
+    async fn list_dependent_send_queue_events(
+        &self,
+        room: &RoomId,
+    ) -> Result<Vec<DependentQueuedEvent>, Self::Error> {
+        Ok(self.dependent_send_queue_events.read().unwrap().get(room).cloned().unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -1006,5 +984,5 @@ mod tests {
         Ok(MemoryStore::new())
     }
 
-    statestore_integration_tests!(with_media_tests);
+    statestore_integration_tests!();
 }

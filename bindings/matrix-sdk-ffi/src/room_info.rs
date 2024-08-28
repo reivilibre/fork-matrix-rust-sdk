@@ -39,7 +39,7 @@ pub struct RoomInfo {
     user_power_levels: HashMap<String, i64>,
     highlight_count: u64,
     notification_count: u64,
-    user_defined_notification_mode: Option<RoomNotificationMode>,
+    cached_user_defined_notification_mode: Option<RoomNotificationMode>,
     has_room_call: bool,
     active_room_call_participants: Vec<String>,
     /// Whether this room has been explicitly marked as unread
@@ -53,6 +53,8 @@ pub struct RoomInfo {
     /// Events causing mentions/highlights for the user, according to their
     /// notification settings.
     num_unread_mentions: u64,
+    /// The currently pinned event ids
+    pinned_event_ids: Vec<String>,
 }
 
 impl RoomInfo {
@@ -64,6 +66,7 @@ impl RoomInfo {
         for (id, level) in power_levels_map.iter() {
             user_power_levels.insert(id.to_string(), *level);
         }
+        let pinned_event_ids = room.pinned_event_ids().iter().map(|id| id.to_string()).collect();
 
         Ok(Self {
             id: room.room_id().to_string(),
@@ -95,9 +98,8 @@ impl RoomInfo {
             user_power_levels,
             highlight_count: unread_notification_counts.highlight_count,
             notification_count: unread_notification_counts.notification_count,
-            user_defined_notification_mode: room
-                .user_defined_notification_mode()
-                .await
+            cached_user_defined_notification_mode: room
+                .cached_user_defined_notification_mode()
                 .map(Into::into),
             has_room_call: room.has_active_room_call(),
             active_room_call_participants: room
@@ -109,6 +111,7 @@ impl RoomInfo {
             num_unread_messages: room.num_unread_messages(),
             num_unread_notifications: room.num_unread_notifications(),
             num_unread_mentions: room.num_unread_mentions(),
+            pinned_event_ids,
         })
     }
 }

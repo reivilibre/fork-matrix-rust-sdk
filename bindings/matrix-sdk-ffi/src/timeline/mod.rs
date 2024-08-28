@@ -19,12 +19,14 @@ use as_variant::as_variant;
 use content::{InReplyToDetails, RepliedToEventDetails};
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt as _};
+#[cfg(doc)]
+use matrix_sdk::crypto::CollectStrategy;
 use matrix_sdk::{
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
         BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
     },
-    deserialized_responses::ShieldState as RustShieldState,
+    deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode},
     Error,
 };
 use matrix_sdk_ui::timeline::{
@@ -60,6 +62,8 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use self::content::{Reaction, ReactionSenderData, TimelineItemContent};
+#[cfg(doc)]
+use crate::client_builder::ClientBuilder;
 use crate::{
     client::ProgressWatcher,
     error::{ClientError, RoomError},
@@ -625,7 +629,7 @@ impl Timeline {
             if let Some(event) = self.inner.item_by_event_id(&event_id).await {
                 Ok(RepliedToEvent::from_timeline_item(&event))
             } else {
-                match self.inner.room().event(&event_id).await {
+                match self.inner.room().event(&event_id, None).await {
                     Ok(timeline_event) => Ok(RepliedToEvent::try_from_timeline_event_for_room(
                         timeline_event,
                         self.inner.room(),
@@ -650,6 +654,26 @@ impl Timeline {
                 RepliedToEventDetails::Error { message: e.to_string() },
             )),
         }
+    }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event containing the new event id.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event was already
+    /// pinned.
+    async fn pin_event(&self, event_id: String) -> Result<bool, ClientError> {
+        let event_id = EventId::parse(event_id).map_err(ClientError::from)?;
+        self.inner.pin_event(&event_id).await.map_err(ClientError::from)
+    }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event without the event id we want to remove.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event wasn't
+    /// pinned
+    async fn unpin_event(&self, event_id: String) -> Result<bool, ClientError> {
+        let event_id = EventId::parse(event_id).map_err(ClientError::from)?;
+        self.inner.unpin_event(&event_id).await.map_err(ClientError::from)
     }
 }
 
@@ -803,6 +827,10 @@ impl TimelineDiff {
         let this = unwrap_or_clone_arc(self);
         as_variant!(this, Self::Reset { values } => values)
     }
+
+    pub fn truncate(&self) -> Option<u32> {
+        as_variant!(self, Self::Truncate { length } => (*length).try_into().unwrap())
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -873,6 +901,29 @@ impl TimelineItem {
 pub enum EventSendState {
     /// The local event has not been sent yet.
     NotSentYet,
+
+    /// One or more verified users in the room has an unsigned device.
+    ///
+    /// Happens only when the room key recipient strategy (as set by
+    /// [`ClientBuilder::room_key_recipient_strategy`]) has
+    /// [`error_on_verified_user_problem`](CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem) set.
+    VerifiedUserHasUnsignedDevice {
+        /// The unsigned devices belonging to verified users. A map from user ID
+        /// to a list of device IDs.
+        devices: HashMap<String, Vec<String>>,
+    },
+
+    /// One or more verified users in the room has changed identity since they
+    /// were verified.
+    ///
+    /// Happens only when the room key recipient strategy (as set by
+    /// [`ClientBuilder::room_key_recipient_strategy`]) has
+    /// [`error_on_verified_user_problem`](CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem) set.
+    VerifiedUserChangedIdentity {
+        /// The users that were previously verified, but are no longer
+        users: Vec<String>,
+    },
+
     /// The local event has been sent to the server, but unsuccessfully: The
     /// sending has failed.
     SendingFailed {
@@ -896,10 +947,39 @@ impl From<&matrix_sdk_ui::timeline::EventSendState> for EventSendState {
         match value {
             NotSentYet => Self::NotSentYet,
             SendingFailed { error, is_recoverable } => {
-                Self::SendingFailed { error: error.to_string(), is_recoverable: *is_recoverable }
+                event_send_state_from_sending_failed(error, *is_recoverable)
             }
             Sent { event_id } => Self::Sent { event_id: event_id.to_string() },
         }
+    }
+}
+
+fn event_send_state_from_sending_failed(error: &Error, is_recoverable: bool) -> EventSendState {
+    use matrix_sdk::crypto::{OlmError, SessionRecipientCollectionError::*};
+
+    match error {
+        // Special-case the SessionRecipientCollectionErrors, to pass the information they contain
+        // back to the application.
+        Error::OlmError(OlmError::SessionRecipientCollectionError(error)) => match error {
+            VerifiedUserHasUnsignedDevice(devices) => {
+                let devices = devices
+                    .iter()
+                    .map(|(user_id, devices)| {
+                        (
+                            user_id.to_string(),
+                            devices.iter().map(|device_id| device_id.to_string()).collect(),
+                        )
+                    })
+                    .collect();
+                EventSendState::VerifiedUserHasUnsignedDevice { devices }
+            }
+
+            VerifiedUserChangedIdentity(bad_users) => EventSendState::VerifiedUserChangedIdentity {
+                users: bad_users.iter().map(|user_id| user_id.to_string()).collect(),
+            },
+        },
+
+        _ => EventSendState::SendingFailed { error: error.to_string(), is_recoverable },
     }
 }
 
@@ -909,10 +989,10 @@ impl From<&matrix_sdk_ui::timeline::EventSendState> for EventSendState {
 pub enum ShieldState {
     /// A red shield with a tooltip containing the associated message should be
     /// presented.
-    Red { message: String },
+    Red { code: ShieldStateCode, message: String },
     /// A grey shield with a tooltip containing the associated message should be
     /// presented.
-    Grey { message: String },
+    Grey { code: ShieldStateCode, message: String },
     /// No shield should be presented.
     None,
 }
@@ -920,8 +1000,12 @@ pub enum ShieldState {
 impl From<RustShieldState> for ShieldState {
     fn from(value: RustShieldState) -> Self {
         match value {
-            RustShieldState::Red { message } => Self::Red { message: message.to_owned() },
-            RustShieldState::Grey { message } => Self::Grey { message: message.to_owned() },
+            RustShieldState::Red { code, message } => {
+                Self::Red { code, message: message.to_owned() }
+            }
+            RustShieldState::Grey { code, message } => {
+                Self::Grey { code, message: message.to_owned() }
+            }
             RustShieldState::None => Self::None,
         }
     }
@@ -978,12 +1062,11 @@ impl EventTimelineItem {
             .iter()
             .map(|(k, v)| Reaction {
                 key: k.to_owned(),
-                count: v.len().try_into().unwrap(),
                 senders: v
-                    .senders()
-                    .map(|v| ReactionSenderData {
-                        sender_id: v.sender_id.to_string(),
-                        timestamp: v.timestamp.0.into(),
+                    .iter()
+                    .map(|(sender_id, info)| ReactionSenderData {
+                        sender_id: sender_id.to_string(),
+                        timestamp: info.timestamp.0.into(),
                     })
                     .collect(),
             })

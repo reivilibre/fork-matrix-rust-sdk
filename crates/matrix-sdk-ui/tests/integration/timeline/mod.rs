@@ -23,7 +23,9 @@ use matrix_sdk::{
     test_utils::{events::EventFactory, logged_in_client_with_server},
 };
 use matrix_sdk_test::{
-    async_test, sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
+    async_test,
+    mocks::{mock_encryption_state, mock_redaction},
+    sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
     SyncResponseBuilder,
 };
 use matrix_sdk_ui::timeline::{EventSendState, RoomExt, TimelineItemContent, VirtualTimelineItem};
@@ -43,8 +45,10 @@ mod echo;
 mod edit;
 mod focus_event;
 mod pagination;
+mod pinned_event;
 mod profiles;
 mod queue;
+mod reactions;
 mod read_receipts;
 mod replies;
 mod subscribe;
@@ -63,6 +67,8 @@ async fn test_reaction() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
@@ -127,7 +133,7 @@ async fn test_reaction() {
     assert_eq!(event_item.reactions().len(), 1);
     let group = &event_item.reactions()["👍"];
     assert_eq!(group.len(), 1);
-    let senders: Vec<_> = group.senders().map(|v| &v.sender_id).collect();
+    let senders: Vec<_> = group.keys().collect();
     assert_eq!(senders.as_slice(), [user_id!("@bob:example.org")]);
 
     // The day divider.
@@ -170,6 +176,8 @@ async fn test_redacted_message() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
@@ -228,6 +236,8 @@ async fn test_redact_message() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
@@ -255,14 +265,7 @@ async fn test_redact_message() {
     assert!(day_divider.is_day_divider());
 
     // Redacting a remote event works.
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/redact/.*?/.*?"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "event_id": "$42"
-        })))
-        .mount(&server)
-        .await;
+    mock_redaction(event_id!("$42")).mount(&server).await;
 
     let event_id = first.as_event().unwrap();
 
@@ -308,6 +311,8 @@ async fn test_read_marker() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
@@ -391,6 +396,8 @@ async fn test_sync_highlighted() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
@@ -457,6 +464,8 @@ async fn test_duplicate_maintains_correct_order() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
 
@@ -506,4 +515,171 @@ async fn test_duplicate_maintains_correct_order() {
     assert_eq!(content, "B");
     let content = items[3].as_event().unwrap().content().as_message().unwrap().body();
     assert_eq!(content, "C");
+}
+
+#[async_test]
+async fn test_pin_event_is_sent_successfully() {
+    let mut setup = PinningTestSetup::new().await;
+    let timeline = setup.timeline().await;
+
+    setup.mock_sync(false).await;
+    assert!(!timeline.items().await.is_empty());
+
+    // Pinning a remote event succeeds.
+    setup
+        .mock_response(ResponseTemplate::new(200).set_body_json(json!({
+            "event_id": "$42"
+        })))
+        .await;
+
+    let event_id = setup.event_id();
+    assert!(timeline.pin_event(event_id).await.unwrap());
+
+    setup.reset_server().await;
+}
+
+#[async_test]
+async fn test_pin_event_is_returning_false_because_is_already_pinned() {
+    let mut setup = PinningTestSetup::new().await;
+    let timeline = setup.timeline().await;
+
+    setup.mock_sync(true).await;
+    assert!(!timeline.items().await.is_empty());
+
+    let event_id = setup.event_id();
+    assert!(!timeline.pin_event(event_id).await.unwrap());
+
+    setup.reset_server().await;
+}
+
+#[async_test]
+async fn test_pin_event_is_returning_an_error() {
+    let mut setup = PinningTestSetup::new().await;
+    let timeline = setup.timeline().await;
+
+    setup.mock_sync(false).await;
+    assert!(!timeline.items().await.is_empty());
+
+    // Pinning a remote event fails.
+    setup.mock_response(ResponseTemplate::new(400)).await;
+
+    let event_id = setup.event_id();
+    assert!(timeline.pin_event(event_id).await.is_err());
+
+    setup.reset_server().await;
+}
+
+#[async_test]
+async fn test_unpin_event_is_sent_successfully() {
+    let mut setup = PinningTestSetup::new().await;
+    let timeline = setup.timeline().await;
+
+    setup.mock_sync(true).await;
+    assert!(!timeline.items().await.is_empty());
+
+    // Unpinning a remote event succeeds.
+    setup
+        .mock_response(ResponseTemplate::new(200).set_body_json(json!({
+            "event_id": "$42"
+        })))
+        .await;
+
+    let event_id = setup.event_id();
+    assert!(timeline.unpin_event(event_id).await.unwrap());
+
+    setup.reset_server().await;
+}
+
+#[async_test]
+async fn test_unpin_event_is_returning_false_because_is_not_pinned() {
+    let mut setup = PinningTestSetup::new().await;
+    let timeline = setup.timeline().await;
+
+    setup.mock_sync(false).await;
+    assert!(!timeline.items().await.is_empty());
+
+    let event_id = setup.event_id();
+    assert!(!timeline.unpin_event(event_id).await.unwrap());
+
+    setup.reset_server().await;
+}
+
+#[async_test]
+async fn test_unpin_event_is_returning_an_error() {
+    let mut setup = PinningTestSetup::new().await;
+    let timeline = setup.timeline().await;
+
+    setup.mock_sync(true).await;
+    assert!(!timeline.items().await.is_empty());
+
+    // Unpinning a remote event fails.
+    setup.mock_response(ResponseTemplate::new(400)).await;
+
+    let event_id = setup.event_id();
+    assert!(timeline.unpin_event(event_id).await.is_err());
+
+    setup.reset_server().await;
+}
+
+struct PinningTestSetup<'a> {
+    event_id: &'a ruma::EventId,
+    room_id: &'a ruma::RoomId,
+    client: matrix_sdk::Client,
+    server: wiremock::MockServer,
+    sync_settings: SyncSettings,
+    sync_builder: SyncResponseBuilder,
+}
+
+impl PinningTestSetup<'_> {
+    async fn new() -> Self {
+        let room_id = room_id!("!a98sd12bjh:example.org");
+        let (client, server) = logged_in_client_with_server().await;
+        let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+        let mut sync_builder = SyncResponseBuilder::new();
+        let event_id = event_id!("$a");
+        sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+        mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+        let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+        server.reset().await;
+
+        Self { event_id, room_id, client, server, sync_settings, sync_builder }
+    }
+
+    async fn timeline(&self) -> matrix_sdk_ui::Timeline {
+        mock_encryption_state(&self.server, false).await;
+        let room = self.client.get_room(self.room_id).unwrap();
+        room.timeline().await.unwrap()
+    }
+
+    async fn reset_server(&self) {
+        self.server.reset().await;
+    }
+
+    async fn mock_response(&self, response: ResponseTemplate) {
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.room.pinned_events/.*?"))
+            .and(header("authorization", "Bearer 1234"))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+    }
+
+    async fn mock_sync(&mut self, is_using_pinned_state_event: bool) {
+        let f = EventFactory::new().sender(user_id!("@a:b.c"));
+        let mut joined_room_builder = JoinedRoomBuilder::new(self.room_id)
+            .add_timeline_event(f.text_msg("A").event_id(self.event_id).into_raw_sync());
+        if is_using_pinned_state_event {
+            joined_room_builder =
+                joined_room_builder.add_state_event(StateTestEvent::RoomPinnedEvents);
+        }
+        self.sync_builder.add_joined_room(joined_room_builder);
+        mock_sync(&self.server, self.sync_builder.build_json_sync_response(), None).await;
+        let _response = self.client.sync_once(self.sync_settings.clone()).await.unwrap();
+    }
+
+    fn event_id(&self) -> &ruma::EventId {
+        self.event_id
+    }
 }

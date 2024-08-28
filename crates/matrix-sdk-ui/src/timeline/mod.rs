@@ -31,7 +31,6 @@ use matrix_sdk::{
     send_queue::{RoomSendQueueError, SendHandle},
     Client, Result,
 };
-use matrix_sdk_base::RoomState;
 use mime::Mime;
 use pin_project_lite::pin_project;
 use ruma::{
@@ -41,7 +40,6 @@ use ruma::{
             ReplacementUnstablePollStartEventContent, UnstablePollStartContentBlock,
             UnstablePollStartEventContent,
         },
-        reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread},
         relation::Annotation,
         room::{
@@ -49,17 +47,19 @@ use ruma::{
                 AddMentions, ForwardThread, OriginalRoomMessageEvent, RoomMessageEventContent,
                 RoomMessageEventContentWithoutRelation,
             },
-            redaction::RoomRedactionEventContent,
+            pinned_events::RoomPinnedEventsEventContent,
         },
         AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         SyncMessageLikeEvent,
     },
     serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    RoomVersionId, TransactionId, UserId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomVersionId, TransactionId,
+    UserId,
 };
 use thiserror::Error;
 use tracing::{error, instrument, trace, warn};
+
+use crate::timeline::pinned_events_loader::PinnedEventsRoom;
 
 mod builder;
 mod day_dividers;
@@ -71,6 +71,7 @@ pub mod futures;
 mod inner;
 mod item;
 mod pagination;
+mod pinned_events_loader;
 mod polls;
 mod reactions;
 mod read_receipts;
@@ -86,24 +87,23 @@ pub use self::{
     builder::TimelineBuilder,
     error::*,
     event_item::{
-        AnyOtherFullStateEventContent, BundledReactions, EncryptedMessage, EventItemOrigin,
-        EventSendState, EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange,
-        Message, OtherState, Profile, ReactionGroup, RepliedToEvent, RoomMembershipChange, Sticker,
-        TimelineDetails, TimelineEventItemId, TimelineItemContent,
+        AnyOtherFullStateEventContent, EncryptedMessage, EventItemOrigin, EventSendState,
+        EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange, Message,
+        OtherState, Profile, ReactionInfo, ReactionStatus, ReactionsByKeyBySender, RepliedToEvent,
+        RoomMembershipChange, RoomPinnedEventsChange, Sticker, TimelineDetails,
+        TimelineEventItemId, TimelineItemContent,
     },
     event_type_filter::TimelineEventTypeFilter,
     inner::default_event_filter,
     item::{TimelineItem, TimelineItemKind},
     pagination::LiveBackPaginationStatus,
     polls::PollResult,
-    reactions::ReactionSenderData,
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
 use self::{
     futures::SendAttachment,
-    inner::{ReactionAction, TimelineInner},
-    reactions::ReactionToggleResult,
+    inner::TimelineInner,
     util::{rfind_event_by_id, rfind_event_item},
 };
 
@@ -164,19 +164,6 @@ pub struct Timeline {
     drop_handle: Arc<TimelineDropHandle>,
 }
 
-// Implements hash etc
-#[derive(Clone, Hash, PartialEq, Eq, Debug)]
-struct AnnotationKey {
-    event_id: OwnedEventId,
-    key: String,
-}
-
-impl From<&Annotation> for AnnotationKey {
-    fn from(annotation: &Annotation) -> Self {
-        Self { event_id: annotation.event_id.clone(), key: annotation.key.clone() }
-    }
-}
-
 /// What should the timeline focus on?
 #[derive(Clone, Debug, PartialEq)]
 pub enum TimelineFocus {
@@ -185,7 +172,14 @@ pub enum TimelineFocus {
     Live,
 
     /// Focus on a specific event, e.g. after clicking a permalink.
-    Event { target: OwnedEventId, num_context_events: u16 },
+    Event {
+        target: OwnedEventId,
+        num_context_events: u16,
+    },
+
+    PinnedEvents {
+        max_events_to_load: u16,
+    },
 }
 
 impl Timeline {
@@ -416,7 +410,7 @@ impl Timeline {
             return timeline_item.replied_to_info();
         }
 
-        let event = self.room().event(event_id).await.map_err(|error| {
+        let event = self.room().event(event_id, None).await.map_err(|error| {
             error!("Failed to fetch event with ID {event_id} with error: {error}");
             UnsupportedReplyItem::MissingEvent
         })?;
@@ -564,79 +558,8 @@ impl Timeline {
     /// Ensures that only one reaction is sent at a time to avoid race
     /// conditions and spamming the homeserver with requests.
     pub async fn toggle_reaction(&self, annotation: &Annotation) -> Result<(), Error> {
-        // Always toggle the local reaction immediately
-        let mut action = self.inner.toggle_reaction_local(annotation).await?;
-
-        // The local echo may have been updated while a reaction is in flight
-        // so until it matches the state of the server, keep reconciling
-        loop {
-            let response = match action {
-                ReactionAction::None => {
-                    // The remote reaction matches the local reaction, OR
-                    // there is already a request in flight which will resolve
-                    // later, so stop here.
-                    break;
-                }
-                ReactionAction::SendRemote(txn_id) => {
-                    self.send_reaction(annotation, txn_id.to_owned()).await
-                }
-                ReactionAction::RedactRemote(event_id) => {
-                    self.redact_reaction(&event_id.to_owned()).await
-                }
-            };
-
-            action = self.inner.resolve_reaction_response(annotation, &response).await?;
-        }
+        self.inner.toggle_reaction_local(annotation).await?;
         Ok(())
-    }
-
-    /// Redact a reaction event from the homeserver
-    async fn redact_reaction(&self, event_id: &EventId) -> ReactionToggleResult {
-        let room = self.room();
-        if room.state() != RoomState::Joined {
-            warn!("Cannot redact a reaction in a room that is not joined");
-            return ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() };
-        }
-
-        let txn_id = TransactionId::new();
-        let no_reason = RoomRedactionEventContent::default();
-
-        let response = room.redact(event_id, no_reason.reason.as_deref(), Some(txn_id)).await;
-
-        match response {
-            Ok(_) => ReactionToggleResult::RedactSuccess,
-            Err(error) => {
-                error!("Failed to redact reaction: {error}");
-                ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() }
-            }
-        }
-    }
-
-    /// Send a reaction event to the homeserver
-    async fn send_reaction(
-        &self,
-        annotation: &Annotation,
-        txn_id: OwnedTransactionId,
-    ) -> ReactionToggleResult {
-        let room = self.room();
-        if room.state() != RoomState::Joined {
-            warn!("Cannot send a reaction in a room that is not joined");
-            return ReactionToggleResult::AddFailure { txn_id };
-        }
-
-        let event_content =
-            AnyMessageLikeEventContent::Reaction(ReactionEventContent::from(annotation.clone()));
-        let response = room.send(event_content).with_transaction_id(&txn_id).await;
-
-        match response {
-            Ok(response) => {
-                ReactionToggleResult::AddSuccess { event_id: response.event_id, txn_id }
-            }
-            Err(error) => {
-                error!("Failed to send reaction: {error}");
-                ReactionToggleResult::AddFailure { txn_id }
-            }
-        }
     }
 
     /// Sends an attachment to the room. It does not currently support local
@@ -870,6 +793,42 @@ impl Timeline {
             Ok(false)
         }
     }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event containing the new event id.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event was already
+    /// pinned.
+    pub async fn pin_event(&self, event_id: &EventId) -> Result<bool> {
+        let mut pinned_event_ids = self.room().pinned_event_ids();
+        let event_id = event_id.to_owned();
+        if pinned_event_ids.contains(&event_id) {
+            Ok(false)
+        } else {
+            pinned_event_ids.push(event_id);
+            let content = RoomPinnedEventsEventContent::new(pinned_event_ids);
+            self.room().send_state_event(content).await?;
+            Ok(true)
+        }
+    }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event without the event id we want to remove.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event wasn't
+    /// pinned.
+    pub async fn unpin_event(&self, event_id: &EventId) -> Result<bool> {
+        let mut pinned_event_ids = self.room().pinned_event_ids();
+        let event_id = event_id.to_owned();
+        if let Some(idx) = pinned_event_ids.iter().position(|e| *e == *event_id) {
+            pinned_event_ids.remove(idx);
+            let content = RoomPinnedEventsEventContent::new(pinned_event_ids);
+            self.room().send_state_event(content).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 /// Test helpers, likely not very useful in production.
@@ -895,6 +854,7 @@ struct TimelineDropHandle {
     client: Client,
     event_handler_handles: Vec<EventHandlerHandle>,
     room_update_join_handle: JoinHandle<()>,
+    pinned_events_join_handle: Option<JoinHandle<()>>,
     room_key_from_backups_join_handle: JoinHandle<()>,
     local_echo_listener_handle: Option<JoinHandle<()>>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
@@ -906,6 +866,9 @@ impl Drop for TimelineDropHandle {
             self.client.remove_event_handler(handle);
         }
         if let Some(handle) = self.local_echo_listener_handle.take() {
+            handle.abort()
+        };
+        if let Some(handle) = self.pinned_events_join_handle.take() {
             handle.abort()
         };
         self.room_update_join_handle.abort();

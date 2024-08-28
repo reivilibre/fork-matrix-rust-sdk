@@ -14,7 +14,6 @@
 
 use itertools::Itertools as _;
 use matrix_sdk::deserialized_responses::TimelineEvent;
-use matrix_sdk_test::test_json;
 use ruma::{events::AnyStateEvent, serde::Raw, EventId, RoomId};
 use serde::Serialize;
 use serde_json::json;
@@ -83,6 +82,22 @@ async fn mock_context(
         .await;
 }
 
+/// Mocks the /event endpoint
+#[allow(clippy::too_many_arguments)] // clippy you've got such a fixed mindset
+async fn mock_event(
+    server: &MockServer,
+    room_id: &RoomId,
+    event_id: &EventId,
+    event: TimelineEvent,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/_matrix/client/r0/rooms/{room_id}/event/{event_id}")))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(event.event.json()))
+        .mount(server)
+        .await;
+}
+
 /// Mocks the /messages endpoint.
 ///
 /// Note: pass `chunk` in the correct order: topological for forward pagination,
@@ -107,28 +122,4 @@ async fn mock_messages(
         .expect(1)
         .mount(server)
         .await;
-}
-
-/// Mount a Mock on the given server to handle the `GET
-/// /rooms/.../state/m.room.encryption` endpoint with an option whether it
-/// should return an encryption event or not.
-async fn mock_encryption_state(server: &MockServer, is_encrypted: bool) {
-    let builder = Mock::given(method("GET"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.*room.*encryption.?"))
-        .and(header("authorization", "Bearer 1234"));
-
-    if is_encrypted {
-        builder
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(&*test_json::sync_events::ENCRYPTION_CONTENT),
-            )
-            .mount(server)
-            .await;
-    } else {
-        builder
-            .respond_with(ResponseTemplate::new(404).set_body_json(&*test_json::NOT_FOUND))
-            .mount(server)
-            .await;
-    }
 }

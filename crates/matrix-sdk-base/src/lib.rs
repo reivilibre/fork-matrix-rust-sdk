@@ -27,8 +27,10 @@ mod client;
 pub mod debug;
 pub mod deserialized_responses;
 mod error;
+pub mod event_cache_store;
 pub mod latest_event;
 pub mod media;
+pub mod notification_settings;
 mod rooms;
 
 pub mod read_receipts;

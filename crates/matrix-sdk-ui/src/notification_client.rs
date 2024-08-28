@@ -373,8 +373,8 @@ impl NotificationClient {
             .build()
             .await?;
 
-        sync.subscribe_to_room(
-            room_id.to_owned(),
+        sync.subscribe_to_rooms(
+            &[room_id],
             Some(assign!(http::request::RoomSubscription::default(), {
                 required_state,
                 timeline_limit: Some(uint!(16))
@@ -478,7 +478,7 @@ impl NotificationClient {
             return Err(Error::UnknownRoom);
         };
 
-        let response = room.event_with_context(event_id, true, uint!(0)).await?;
+        let response = room.event_with_context(event_id, true, uint!(0), None).await?;
 
         let mut timeline_event = response.event.ok_or(Error::ContextMissingEvent)?;
         let state_events = response.state;

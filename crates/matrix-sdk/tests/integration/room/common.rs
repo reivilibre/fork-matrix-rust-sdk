@@ -1,22 +1,27 @@
 use std::{iter, time::Duration};
 
 use assert_matches2::assert_let;
-use matrix_sdk::{config::SyncSettings, room::RoomMember, DisplayName, RoomMemberships};
+use js_int::uint;
+use matrix_sdk::{
+    config::SyncSettings, room::RoomMember, test_utils::events::EventFactory, DisplayName,
+    RoomMemberships,
+};
 use matrix_sdk_test::{
     async_test, bulk_room_members, sync_state_event, sync_timeline_event, test_json,
-    JoinedRoomBuilder, LeftRoomBuilder, StateTestEvent, SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
+    GlobalAccountDataTestEvent, JoinedRoomBuilder, LeftRoomBuilder, StateTestEvent,
+    SyncResponseBuilder, BOB, DEFAULT_TEST_ROOM_ID,
 };
 use ruma::{
     event_id,
     events::{
-        room::member::MembershipState, AnyStateEvent, AnySyncStateEvent, AnyTimelineEvent,
-        StateEventType,
+        room::{member::MembershipState, message::RoomMessageEventContent},
+        AnyStateEvent, AnySyncStateEvent, AnyTimelineEvent, StateEventType,
     },
     room_id,
 };
 use serde_json::json;
 use wiremock::{
-    matchers::{header, method, path_regex},
+    matchers::{body_json, header, method, path, path_regex},
     Mock, ResponseTemplate,
 };
 
@@ -619,6 +624,9 @@ async fn test_event() {
     let event_id = event_id!("$foun39djjod0f");
 
     let (client, server) = logged_in_client_with_server().await;
+    let cache = client.event_cache();
+    let _ = cache.subscribe();
+
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut sync_builder = SyncResponseBuilder::new();
@@ -657,7 +665,7 @@ async fn test_event() {
         .mount(&server)
         .await;
 
-    let timeline_event = room.event(event_id).await.unwrap();
+    let timeline_event = room.event(event_id, None).await.unwrap();
     assert_let!(
         AnyTimelineEvent::State(AnyStateEvent::RoomTombstone(event)) =
             timeline_event.event.deserialize().unwrap()
@@ -667,4 +675,186 @@ async fn test_event() {
     let push_actions = timeline_event.push_actions.unwrap();
     assert!(push_actions.iter().any(|a| a.is_highlight()));
     assert!(push_actions.iter().any(|a| a.should_notify()));
+
+    // Requested event was saved to the cache
+    assert!(cache.event(event_id).await.is_some());
+}
+
+#[async_test]
+async fn test_event_with_context() {
+    let event_id = event_id!("$cur1234");
+    let prev_event_id = event_id!("$prev1234");
+    let next_event_id = event_id!("$next_1234");
+
+    let (client, server) = logged_in_client_with_server().await;
+    let cache = client.event_cache();
+    let _ = cache.subscribe();
+
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder
+        // We need the member event and power levels locally so the push rules processor works.
+        .add_joined_room(
+            JoinedRoomBuilder::new(&DEFAULT_TEST_ROOM_ID)
+                .add_state_event(StateTestEvent::Member)
+                .add_state_event(StateTestEvent::PowerLevels),
+        );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
+    let room_id = room.room_id();
+
+    let f = EventFactory::new().room(room_id).sender(*BOB);
+    let event =
+        f.event(RoomMessageEventContent::text_plain("The requested message")).event_id(event_id);
+    let event_before =
+        f.event(RoomMessageEventContent::text_plain("A previous message")).event_id(prev_event_id);
+    let event_next =
+        f.event(RoomMessageEventContent::text_plain("A newer message")).event_id(next_event_id);
+    Mock::given(method("GET"))
+        .and(path(format!("/_matrix/client/r0/rooms/{room_id}/context/{event_id}")))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "events_before": [event_before.into_raw_timeline()],
+            "event": event.into_raw_timeline(),
+            "events_after": [event_next.into_raw_timeline()],
+            "state": [],
+        })))
+        .mount(&server)
+        .await;
+
+    let context_ret = room.event_with_context(event_id, false, uint!(1), None).await.unwrap();
+
+    assert_let!(Some(timeline_event) = context_ret.event);
+    assert_let!(Ok(event) = timeline_event.event.deserialize());
+    assert_eq!(event.event_id(), event_id);
+
+    assert_eq!(1, context_ret.events_before.len());
+    assert_let!(Ok(event) = context_ret.events_before[0].event.deserialize());
+    assert_eq!(event.event_id(), prev_event_id);
+
+    assert_eq!(1, context_ret.events_after.len());
+    assert_let!(Ok(event) = context_ret.events_after[0].event.deserialize());
+    assert_eq!(event.event_id(), next_event_id);
+
+    // Requested event and their context ones were saved to the cache
+    assert!(cache.event(event_id).await.is_some());
+    assert!(cache.event(prev_event_id).await.is_some());
+    assert!(cache.event(next_event_id).await.is_some());
+}
+
+#[async_test]
+async fn test_is_direct() {
+    let (client, server) = logged_in_client_with_server().await;
+    let own_user_id = client.user_id().unwrap();
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let bob_member_event = json!({
+        "content": {
+            "membership": "join",
+        },
+        "event_id": "$747273582443PhrSn:localhost",
+        "origin_server_ts": 1472735824,
+        "sender": *BOB,
+        "state_key": *BOB,
+        "type": "m.room.member",
+        "unsigned": {
+            "age": 1234
+        }
+    });
+
+    // Initialize the room with 2 members, including ourself.
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(&DEFAULT_TEST_ROOM_ID)
+            .add_state_event(StateTestEvent::Member)
+            .add_state_event(StateTestEvent::Custom(bob_member_event.clone())),
+    );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
+
+    // The room is not direct.
+    assert!(room.direct_targets().is_empty());
+    assert!(!room.is_direct().await.unwrap());
+
+    // Set the room as direct.
+    let direct_content = json!({
+        *BOB: [*DEFAULT_TEST_ROOM_ID],
+    });
+
+    // Setting the room as direct will request the members of the room.
+    Mock::given(method("GET"))
+        .and(path_regex(format!("^/_matrix/client/r0/rooms/{}/members$", *DEFAULT_TEST_ROOM_ID)))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk": [
+                *test_json::MEMBER,
+                bob_member_event,
+            ],
+        })))
+        .expect(1)
+        .named("members")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(format!("^/_matrix/client/r0/user/{own_user_id}/account_data/m.direct$")))
+        .and(header("authorization", "Bearer 1234"))
+        .and(body_json(&direct_content))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .named("set_direct")
+        .mount(&server)
+        .await;
+
+    room.set_is_direct(true).await.unwrap();
+
+    // Mock the sync response we should get from the homeserver.
+    sync_builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(json!({
+        "type": "m.direct",
+        "content": direct_content,
+    })));
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    // The room is direct now.
+    let direct_targets = room.direct_targets();
+    assert_eq!(direct_targets.len(), 1);
+    assert!(direct_targets.contains(*BOB));
+    assert!(room.is_direct().await.unwrap());
+
+    // Unset the room as direct.
+    let direct_content = json!({});
+
+    Mock::given(method("PUT"))
+        .and(path_regex(format!("^/_matrix/client/r0/user/{own_user_id}/account_data/m.direct$")))
+        .and(header("authorization", "Bearer 1234"))
+        .and(body_json(&direct_content))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .named("unset_direct")
+        .mount(&server)
+        .await;
+
+    // Mock the sync response we should get from the homeserver.
+    sync_builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(json!({
+        "type": "m.direct",
+        "content": direct_content,
+    })));
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    // The room is not direct anymore.
+    assert!(room.direct_targets().is_empty());
+    assert!(!room.is_direct().await.unwrap());
 }

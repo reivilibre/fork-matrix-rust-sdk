@@ -308,7 +308,7 @@ impl Sas {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(crate) fn set_creation_time(&self, time: matrix_sdk_common::instant::Instant) {
+    pub(crate) fn set_creation_time(&self, time: ruma::time::Instant) {
         self.inner.update(|inner| {
             inner.set_creation_time(time);
         });
@@ -912,7 +912,11 @@ mod tests {
 
         let alice_store = VerificationStore {
             account: alice.static_data.clone(),
-            inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), MemoryStore::new())),
+            inner: Arc::new(CryptoStoreWrapper::new(
+                alice.user_id(),
+                alice_device_id(),
+                MemoryStore::new(),
+            )),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())).into(),
         };
 
@@ -921,7 +925,7 @@ mod tests {
 
         let bob_store = VerificationStore {
             account: bob.static_data.clone(),
-            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
+            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_device_id(), bob_store)),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(bob_id())).into(),
         };
 

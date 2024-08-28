@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt, iter,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
@@ -10,8 +10,10 @@ use async_trait::async_trait;
 use deadpool_sqlite::{Object as SqliteConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     deserialized_responses::{RawAnySyncOrStrippedState, SyncOrStrippedState},
-    media::{MediaRequest, UniqueKey},
-    store::{migration_helpers::RoomInfoV1, QueuedEvent, SerializableEventContent},
+    store::{
+        migration_helpers::RoomInfoV1, ChildTransactionId, DependentQueuedEvent,
+        DependentQueuedEventKind, QueuedEvent, SerializableEventContent,
+    },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateChanges, StateStore,
     StateStoreDataKey, StateStoreDataValue,
 };
@@ -55,28 +57,28 @@ mod keys {
     pub const PROFILE: &str = "profile";
     pub const RECEIPT: &str = "receipt";
     pub const DISPLAY_NAME: &str = "display_name";
-    pub const MEDIA: &str = "media";
     pub const SEND_QUEUE: &str = "send_queue_events";
+    pub const DEPENDENTS_SEND_QUEUE: &str = "dependent_send_queue_events";
 }
 
-const DATABASE_VERSION: u8 = 5;
+/// Identifier of the latest database version.
+///
+/// This is used to figure whether the sqlite database requires a migration.
+/// Every new SQL migration should imply a bump of this number, and changes in
+/// the [`SqliteStateStore::run_migrations`] function..
+const DATABASE_VERSION: u8 = 7;
 
 /// A sqlite based cryptostore.
 #[derive(Clone)]
 pub struct SqliteStateStore {
     store_cipher: Option<Arc<StoreCipher>>,
-    path: Option<PathBuf>,
     pool: SqlitePool,
 }
 
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for SqliteStateStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(path) = &self.path {
-            f.debug_struct("SqliteStateStore").field("path", &path).finish()
-        } else {
-            f.debug_struct("SqliteStateStore").field("path", &"memory store").finish()
-        }
+        f.debug_struct("SqliteStateStore").finish_non_exhaustive()
     }
 }
 
@@ -110,7 +112,7 @@ impl SqliteStateStore {
             Some(p) => Some(Arc::new(get_or_create_store_cipher(p, &conn).await?)),
             None => None,
         };
-        let this = Self { store_cipher, path: None, pool };
+        let this = Self { store_cipher, pool };
         this.run_migrations(&conn, version, None).await?;
 
         Ok(this)
@@ -235,6 +237,26 @@ impl SqliteStateStore {
             .await?;
         }
 
+        if from < 6 && to >= 6 {
+            conn.with_transaction(move |txn| {
+                // Create new table.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/005_send_queue_dependent_events.sql"
+                ))?;
+                Result::<_, Error>::Ok(())
+            })
+            .await?;
+        }
+
+        if from < 7 && to >= 7 {
+            conn.with_transaction(move |txn| {
+                // Drop media table.
+                txn.execute_batch(include_str!("../migrations/state_store/006_drop_media.sql"))?;
+                Result::<_, Error>::Ok(())
+            })
+            .await?;
+        }
+
         conn.set_kv("version", vec![to]).await?;
 
         Ok(())
@@ -324,7 +346,7 @@ impl SqliteStateStore {
         self.encode_key(keys::KV_BLOB, full_key)
     }
 
-    async fn acquire(&self) -> Result<deadpool_sqlite::Object> {
+    async fn acquire(&self) -> Result<SqliteConn> {
         Ok(self.pool.get().await?)
     }
 
@@ -654,15 +676,17 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     async fn get_kv_blobs(&self, keys: Vec<Key>) -> Result<Vec<Vec<u8>>> {
         let keys_length = keys.len();
 
-        self.chunk_large_query_over(keys, Some(keys_length), |keys| {
+        self.chunk_large_query_over(keys, Some(keys_length), |txn, keys| {
             let sql_params = repeat_vars(keys.len());
             let sql = format!("SELECT value FROM kv_blob WHERE key IN ({sql_params})");
 
             let params = rusqlite::params_from_iter(keys);
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| row.get(0)).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| row.get(0))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -682,15 +706,15 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 })
                 .await?)
         } else {
-            self.chunk_large_query_over(states, None, |states| {
+            self.chunk_large_query_over(states, None, |txn, states| {
                 let sql_params = repeat_vars(states.len());
                 let sql = format!("SELECT data FROM room_info WHERE state IN ({sql_params})");
 
-                self.prepare(sql, move |mut stmt| {
-                    stmt.query(rusqlite::params_from_iter(states))?
-                        .mapped(|row| row.get(0))
-                        .collect()
-                })
+                Ok(txn
+                    .prepare(&sql)?
+                    .query(rusqlite::params_from_iter(states))?
+                    .mapped(|row| row.get(0))
+                    .collect::<Result<_, _>>()?)
             })
             .await
         }
@@ -702,7 +726,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
         event_type: Key,
         state_keys: Vec<Key>,
     ) -> Result<Vec<(bool, Vec<u8>)>> {
-        self.chunk_large_query_over(state_keys, None, move |state_keys: Vec<Key>| {
+        self.chunk_large_query_over(state_keys, None, move |txn, state_keys: Vec<Key>| {
             let sql_params = repeat_vars(state_keys.len());
             let sql = format!(
                 "SELECT stripped, data FROM state_event
@@ -713,9 +737,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 [room_id.clone(), event_type.clone()].into_iter().chain(state_keys),
             );
 
-            self.prepare(sql, |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -745,7 +771,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let user_ids_length = user_ids.len();
 
-        self.chunk_large_query_over(user_ids, Some(user_ids_length), move |user_ids| {
+        self.chunk_large_query_over(user_ids, Some(user_ids_length), move |txn, user_ids| {
             let sql_params = repeat_vars(user_ids.len());
             let sql = format!(
                 "SELECT user_id, data FROM profile WHERE room_id = ? AND user_id IN ({sql_params})"
@@ -753,9 +779,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 
             let params = rusqlite::params_from_iter(iter::once(room_id.clone()).chain(user_ids));
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -767,7 +795,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
             })
             .await?
         } else {
-            self.chunk_large_query_over(memberships, None, move |memberships| {
+            self.chunk_large_query_over(memberships, None, move |txn, memberships| {
                 let sql_params = repeat_vars(memberships.len());
                 let sql = format!(
                     "SELECT data FROM member WHERE room_id = ? AND membership IN ({sql_params})"
@@ -776,9 +804,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 let params =
                     rusqlite::params_from_iter(iter::once(room_id.clone()).chain(memberships));
 
-                self.prepare(sql, move |mut stmt| {
-                    stmt.query(params)?.mapped(|row| row.get(0)).collect()
-                })
+                Ok(txn
+                    .prepare(&sql)?
+                    .query(params)?
+                    .mapped(|row| row.get(0))
+                    .collect::<Result<_, _>>()?)
             })
             .await?
         };
@@ -819,7 +849,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let names_length = names.len();
 
-        self.chunk_large_query_over(names, Some(names_length), move |names| {
+        self.chunk_large_query_over(names, Some(names_length), move |txn, names| {
             let sql_params = repeat_vars(names.len());
             let sql = format!(
                 "SELECT name, data FROM display_name WHERE room_id = ? AND name IN ({sql_params})"
@@ -827,9 +857,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 
             let params = rusqlite::params_from_iter(iter::once(room_id.clone()).chain(names));
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -871,40 +903,10 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
             )
             .await?)
     }
-
-    async fn set_media(&self, uri: Key, format: Key, data: Vec<u8>) -> Result<()> {
-        self.execute(
-            "INSERT OR REPLACE INTO media (uri, format, data) VALUES (?, ?, ?)",
-            (uri, format, data),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn get_media(&self, uri: Key, format: Key) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .query_row(
-                "SELECT data FROM media WHERE uri = ? AND format = ?",
-                (uri, format),
-                |row| row.get(0),
-            )
-            .await
-            .optional()?)
-    }
-
-    async fn remove_media(&self, uri: Key, format: Key) -> Result<()> {
-        self.execute("DELETE FROM media WHERE uri = ? AND format = ?", (uri, format)).await?;
-        Ok(())
-    }
-
-    async fn remove_uri_medias(&self, uri: Key) -> Result<()> {
-        self.execute("DELETE FROM media WHERE uri = ?", (uri,)).await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
-impl SqliteObjectStateStoreExt for deadpool_sqlite::Object {
+impl SqliteObjectStateStoreExt for SqliteConn {
     async fn set_kv_blob(&self, key: Key, value: Vec<u8>) -> Result<()> {
         Ok(self.interact(move |conn| conn.set_kv_blob(&key, &value)).await.unwrap()?)
     }
@@ -1629,31 +1631,6 @@ impl StateStore for SqliteStateStore {
         Ok(previous)
     }
 
-    async fn add_media_content(&self, request: &MediaRequest, content: Vec<u8>) -> Result<()> {
-        let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
-        let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        let data = self.encode_value(content)?;
-        self.acquire().await?.set_media(uri, format, data).await
-    }
-
-    async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
-        let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
-        let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        let data = self.acquire().await?.get_media(uri, format).await?;
-        data.map(|v| self.decode_value(&v).map(Into::into)).transpose()
-    }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
-        let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
-        let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        self.acquire().await?.remove_media(uri, format).await
-    }
-
-    async fn remove_media_content_for_uri(&self, uri: &ruma::MxcUri) -> Result<()> {
-        let uri = self.encode_key(keys::MEDIA, uri);
-        self.acquire().await?.remove_uri_medias(uri).await
-    }
-
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
         let this = self.clone();
         let room_id = room_id.to_owned();
@@ -1755,7 +1732,7 @@ impl StateStore for SqliteStateStore {
                 txn.prepare_cached(
                     "DELETE FROM send_queue_events WHERE room_id = ? AND transaction_id = ?",
                 )?
-                .execute((room_id, transaction_id))
+                .execute((room_id, &transaction_id))
             })
             .await?;
 
@@ -1838,6 +1815,114 @@ impl StateStore for SqliteStateStore {
             .into_iter()
             .collect())
     }
+
+    async fn save_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        content: DependentQueuedEventKind,
+    ) -> Result<()> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let content = self.serialize_json(&content)?;
+
+        // See comment in `save_send_queue_event`.
+        let parent_txn_id = parent_txn_id.to_string();
+        let own_txn_id = own_txn_id.to_string();
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    r#"INSERT INTO dependent_send_queue_events
+                         (room_id, parent_transaction_id, own_transaction_id, content)
+                       VALUES (?, ?, ?, ?)"#,
+                )?
+                .execute((room_id, parent_txn_id, own_txn_id, content))?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn update_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        event_id: OwnedEventId,
+    ) -> Result<usize> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let event_id = self.serialize_value(&event_id)?;
+
+        // See comment in `save_send_queue_event`.
+        let parent_txn_id = parent_txn_id.to_string();
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                Ok(txn.prepare_cached(
+                    "UPDATE dependent_send_queue_events SET event_id = ? WHERE parent_transaction_id = ? and room_id = ?",
+                )?
+                .execute((event_id, parent_txn_id, room_id))?)
+            })
+            .await
+    }
+
+    async fn remove_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        txn_id: &ChildTransactionId,
+    ) -> Result<bool> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+
+        // See comment in `save_send_queue_event`.
+        let txn_id = txn_id.to_string();
+
+        let num_deleted = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    "DELETE FROM dependent_send_queue_events WHERE own_transaction_id = ? AND room_id = ?",
+                )?
+                .execute((txn_id, room_id))
+            })
+            .await?;
+
+        Ok(num_deleted > 0)
+    }
+
+    async fn list_dependent_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<DependentQueuedEvent>> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+
+        // Note: transaction_id is not encoded, see why in `save_send_queue_event`.
+        let res: Vec<(String, String, Option<Vec<u8>>, Vec<u8>)> = self
+            .acquire()
+            .await?
+            .prepare(
+                "SELECT own_transaction_id, parent_transaction_id, event_id, content FROM dependent_send_queue_events WHERE room_id = ? ORDER BY ROWID",
+                |mut stmt| {
+                    stmt.query((room_id,))?
+                        .mapped(|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                        .collect()
+                },
+            )
+            .await?;
+
+        let mut dependent_events = Vec::with_capacity(res.len());
+        for entry in res {
+            dependent_events.push(DependentQueuedEvent {
+                own_transaction_id: entry.0.into(),
+                parent_transaction_id: entry.1.into(),
+                event_id: entry.2.map(|bytes| self.deserialize_value(&bytes)).transpose()?,
+                kind: self.deserialize_json(&entry.3)?,
+            });
+        }
+
+        Ok(dependent_events)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1869,7 +1954,7 @@ mod tests {
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), None).await.unwrap())
     }
 
-    statestore_integration_tests!(with_media_tests);
+    statestore_integration_tests!();
 }
 
 #[cfg(test)]
@@ -1896,7 +1981,7 @@ mod encrypted_tests {
             .unwrap())
     }
 
-    statestore_integration_tests!(with_media_tests);
+    statestore_integration_tests!();
 }
 
 #[cfg(test)]
@@ -1943,7 +2028,7 @@ mod migration_tests {
         init(&conn).await?;
 
         let store_cipher = Some(Arc::new(get_or_create_store_cipher(SECRET, &conn).await.unwrap()));
-        let this = SqliteStateStore { store_cipher, path: None, pool };
+        let this = SqliteStateStore { store_cipher, pool };
         this.run_migrations(&conn, 1, Some(version)).await?;
 
         Ok(this)

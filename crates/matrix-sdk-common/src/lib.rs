@@ -19,8 +19,6 @@ use std::pin::Pin;
 
 use futures_core::Future;
 #[doc(no_inline)]
-pub use instant;
-#[doc(no_inline)]
 pub use ruma;
 
 pub mod debug;
@@ -97,3 +95,6 @@ macro_rules! boxed_into_future {
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 #[cfg(not(target_arch = "wasm32"))]
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();

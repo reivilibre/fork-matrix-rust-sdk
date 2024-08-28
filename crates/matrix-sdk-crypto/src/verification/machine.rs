@@ -578,7 +578,7 @@ mod tests {
         let _ = VerificationMachine::new(
             alice.static_data,
             identity,
-            Arc::new(CryptoStoreWrapper::new(alice_id(), MemoryStore::new())),
+            Arc::new(CryptoStoreWrapper::new(alice_id(), alice_device_id(), MemoryStore::new())),
         );
     }
 
@@ -642,7 +642,7 @@ mod tests {
     async fn timing_out() {
         use std::time::Duration;
 
-        use matrix_sdk_common::instant::Instant;
+        use ruma::time::Instant;
 
         let (alice_machine, bob) = setup_verification_machine().await;
         let alice = alice_machine.get_sas(bob.user_id(), bob.flow_id().as_str()).unwrap();

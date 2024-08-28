@@ -99,3 +99,41 @@ pub async fn logged_in_client_with_server() -> (Client, wiremock::MockServer) {
     let client = logged_in_client(Some(server.uri().to_string())).await;
     (client, server)
 }
+
+/// Asserts the next item in a [`Stream`] can be loaded in the given timeout in
+/// the given timeout in milliseconds.
+#[macro_export]
+macro_rules! assert_next_with_timeout {
+    ($stream:expr, $timeout_ms:expr) => {{
+        use futures_util::StreamExt as _;
+        tokio::time::timeout(std::time::Duration::from_millis($timeout_ms), $stream.next())
+            .await
+            .expect("Next event timed out")
+            .expect("No next event received")
+    }};
+}
+
+/// Assert the next item in a [`Stream`] matches the provided pattern in the
+/// given timeout in milliseconds.
+///
+/// If no timeout is provided, a default `100ms` value will be used.
+#[macro_export]
+macro_rules! assert_next_matches_with_timeout {
+    ($stream:expr, $pat:pat) => {
+        $crate::assert_next_matches_with_timeout!($stream, $pat => {})
+    };
+    ($stream:expr, $pat:pat => $arm:expr) => {
+        $crate::assert_next_matches_with_timeout!($stream, 100, $pat => $arm)
+    };
+    ($stream:expr, $timeout_ms:expr, $pat:pat => $arm:expr) => {
+        match $crate::assert_next_with_timeout!(&mut $stream, $timeout_ms) {
+            $pat => $arm,
+            val => {
+                ::core::panic!(
+                    "assertion failed: `{:?}` does not match `{}`",
+                    val, ::core::stringify!($pat)
+                );
+            }
+        }
+    };
+}

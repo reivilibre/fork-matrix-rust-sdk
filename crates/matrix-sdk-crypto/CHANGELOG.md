@@ -2,6 +2,11 @@
 
 Changes:
 
+- Add message IDs to all outgoing to-device messages encrypted by
+  `matrix-sdk-crypto`. The `message-ids` feature of `matrix-sdk-crypto` and
+  `matrix-sdk-base` is now a no-op.
+  ([#3776](https://github.com/matrix-org/matrix-rust-sdk/pull/3776))
+
 - Log the content of received `m.room_key.withheld` to-device events.
   ([#3591](https://github.com/matrix-org/matrix-rust-sdk/pull/3591))
 
@@ -26,6 +31,41 @@ Changes:
   ([#3151](https://github.com/matrix-org/matrix-rust-sdk/pull/3151))
 
 Breaking changes:
+
+  **NOTE**: this version causes changes to the format of the serialised data in
+  the CryptoStore, meaning that, once upgraded, it will not be possible to roll
+  back applications to earlier versions without breaking user sessions.
+
+- Change the structure of the `SenderData` enum to separate variants for
+  previously-verified, unverified and verified.
+  ([#3877](https://github.com/matrix-org/matrix-rust-sdk/pull/3877))
+
+- Where `EncryptionInfo` is returned it may include the new `PreviouslyVerified`
+  variant of `VerificationLevel` to indicate that the user was previously
+  verified and is no longer verified.
+  ([#3877](https://github.com/matrix-org/matrix-rust-sdk/pull/3877))
+
+- Expose new methods `OwnUserIdentity::was_previously_verified`,
+  `OwnUserIdentity::withdraw_verification`, and
+  `OwnUserIdentity::has_verification_violation`, which track whether our own
+  identity was previously verified.
+  ([#3846](https://github.com/matrix-org/matrix-rust-sdk/pull/3846))
+
+- Add a new `error_on_verified_user_problem` property to
+  `CollectStrategy::DeviceBasedStrategy`, which, when set, causes
+  `OlmMachine::share_room_key` to fail with an error if any verified users on
+  the recipient list have unsigned devices, or are no lonver verified.
+
+  Also remove `CollectStrategy::new_device_based`: callers should construct a
+  `CollectStrategy::DeviceBasedStrategy` directly.
+
+  `EncryptionSettings::new` now takes a `CollectStrategy` argument, instead of
+  a list of booleans.
+  ([#3810](https://github.com/matrix-org/matrix-rust-sdk/pull/3810))
+  ([#3816](https://github.com/matrix-org/matrix-rust-sdk/pull/3816))
+
+- Remove the method `OlmMachine::clear_crypto_cache()`, crypto stores are not
+  supposed to have any caches anymore.
 
 - Add a `custom_account` argument to the `OlmMachine::with_store()` method, this
   allows users to learn their identity keys before they get access to the user

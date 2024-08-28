@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloomBuilder;
 use matrix_sdk_test::test_json;
 use ruma::{
-    api::{client::media::get_content_thumbnail::v3::Method, MatrixVersion},
+    api::MatrixVersion,
     event_id,
     events::{
         presence::PresenceEvent,
@@ -21,24 +21,22 @@ use ruma::{
             message::RoomMessageEventContent,
             power_levels::RoomPowerLevelsEventContent,
             topic::RoomTopicEventContent,
-            MediaSource,
         },
         AnyEphemeralRoomEventContent, AnyGlobalAccountDataEvent, AnyMessageLikeEventContent,
         AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncEphemeralRoomEvent,
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
         SyncStateEvent,
     },
-    mxc_uri, owned_mxc_uri, room_id,
+    owned_event_id, owned_mxc_uri, room_id,
     serde::Raw,
     uint, user_id, EventId, OwnedEventId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde_json::{json, value::Value as JsonValue};
 
-use super::{DynStateStore, ServerCapabilities};
+use super::{DependentQueuedEventKind, DynStateStore, ServerCapabilities};
 use crate::{
     deserialized_responses::MemberEvent,
-    media::{MediaFormat, MediaRequest, MediaThumbnailSettings},
-    store::{Result, SerializableEventContent, StateStoreExt},
+    store::{traits::ChildTransactionId, Result, SerializableEventContent, StateStoreExt},
     RoomInfo, RoomMemberships, RoomState, StateChanges, StateStoreDataKey, StateStoreDataValue,
 };
 
@@ -51,8 +49,6 @@ use crate::{
 pub trait StateStoreIntegrationTests {
     /// Populate the given `StateStore`.
     async fn populate(&self) -> Result<()>;
-    /// Test media content storage.
-    async fn test_media_content(&self);
     /// Test room topic redaction.
     async fn test_topic_redaction(&self) -> Result<()>;
     /// Test populating the store.
@@ -89,6 +85,8 @@ pub trait StateStoreIntegrationTests {
     async fn test_display_names_saving(&self);
     /// Test operations with the send queue.
     async fn test_send_queue(&self);
+    /// Test operations related to send queue dependents.
+    async fn test_send_queue_dependents(&self);
     /// Test saving/restoring server capabilities.
     async fn test_server_capabilities_saving(&self);
 }
@@ -209,110 +207,6 @@ impl StateStoreIntegrationTests for DynStateStore {
         self.save_changes(&changes).await?;
 
         Ok(())
-    }
-
-    async fn test_media_content(&self) {
-        let uri = mxc_uri!("mxc://localhost/media");
-        let request_file =
-            MediaRequest { source: MediaSource::Plain(uri.to_owned()), format: MediaFormat::File };
-        let request_thumbnail = MediaRequest {
-            source: MediaSource::Plain(uri.to_owned()),
-            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
-                Method::Crop,
-                uint!(100),
-                uint!(100),
-            )),
-        };
-
-        let other_uri = mxc_uri!("mxc://localhost/media-other");
-        let request_other_file = MediaRequest {
-            source: MediaSource::Plain(other_uri.to_owned()),
-            format: MediaFormat::File,
-        };
-
-        let content: Vec<u8> = "hello".into();
-        let thumbnail_content: Vec<u8> = "world".into();
-        let other_content: Vec<u8> = "foo".into();
-
-        // Media isn't present in the cache.
-        assert!(
-            self.get_media_content(&request_file).await.unwrap().is_none(),
-            "unexpected media found"
-        );
-        assert!(
-            self.get_media_content(&request_thumbnail).await.unwrap().is_none(),
-            "media not found"
-        );
-
-        // Let's add the media.
-        self.add_media_content(&request_file, content.clone()).await.expect("adding media failed");
-
-        // Media is present in the cache.
-        assert_eq!(
-            self.get_media_content(&request_file).await.unwrap().as_ref(),
-            Some(&content),
-            "media not found though added"
-        );
-
-        // Let's remove the media.
-        self.remove_media_content(&request_file).await.expect("removing media failed");
-
-        // Media isn't present in the cache.
-        assert!(
-            self.get_media_content(&request_file).await.unwrap().is_none(),
-            "media still there after removing"
-        );
-
-        // Let's add the media again.
-        self.add_media_content(&request_file, content.clone())
-            .await
-            .expect("adding media again failed");
-
-        assert_eq!(
-            self.get_media_content(&request_file).await.unwrap().as_ref(),
-            Some(&content),
-            "media not found after adding again"
-        );
-
-        // Let's add the thumbnail media.
-        self.add_media_content(&request_thumbnail, thumbnail_content.clone())
-            .await
-            .expect("adding thumbnail failed");
-
-        // Media's thumbnail is present.
-        assert_eq!(
-            self.get_media_content(&request_thumbnail).await.unwrap().as_ref(),
-            Some(&thumbnail_content),
-            "thumbnail not found"
-        );
-
-        // Let's add another media with a different URI.
-        self.add_media_content(&request_other_file, other_content.clone())
-            .await
-            .expect("adding other media failed");
-
-        // Other file is present.
-        assert_eq!(
-            self.get_media_content(&request_other_file).await.unwrap().as_ref(),
-            Some(&other_content),
-            "other file not found"
-        );
-
-        // Let's remove media based on URI.
-        self.remove_media_content_for_uri(uri).await.expect("removing all media for uri failed");
-
-        assert!(
-            self.get_media_content(&request_file).await.unwrap().is_none(),
-            "media wasn't removed"
-        );
-        assert!(
-            self.get_media_content(&request_thumbnail).await.unwrap().is_none(),
-            "thumbnail wasn't removed"
-        );
-        assert!(
-            self.get_media_content(&request_other_file).await.unwrap().is_some(),
-            "other media was removed"
-        );
     }
 
     async fn test_topic_redaction(&self) -> Result<()> {
@@ -1481,6 +1375,104 @@ impl StateStoreIntegrationTests for DynStateStore {
         assert!(outstanding_rooms.iter().any(|room| room == room_id));
         assert!(outstanding_rooms.iter().any(|room| room == room_id2));
     }
+
+    async fn test_send_queue_dependents(&self) {
+        let room_id = room_id!("!test_send_queue_dependents:localhost");
+
+        // Save one send queue event to start with.
+        let txn0 = TransactionId::new();
+        let event0 =
+            SerializableEventContent::new(&RoomMessageEventContent::text_plain("hey").into())
+                .unwrap();
+        self.save_send_queue_event(room_id, txn0.clone(), event0).await.unwrap();
+
+        // No dependents, to start with.
+        assert!(self.list_dependent_send_queue_events(room_id).await.unwrap().is_empty());
+
+        // Save a redaction for that event.
+        let child_txn = ChildTransactionId::new();
+        self.save_dependent_send_queue_event(
+            room_id,
+            &txn0,
+            child_txn.clone(),
+            DependentQueuedEventKind::Redact,
+        )
+        .await
+        .unwrap();
+
+        // It worked.
+        let dependents = self.list_dependent_send_queue_events(room_id).await.unwrap();
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].parent_transaction_id, txn0);
+        assert_eq!(dependents[0].own_transaction_id, child_txn);
+        assert!(dependents[0].event_id.is_none());
+        assert_matches!(dependents[0].kind, DependentQueuedEventKind::Redact);
+
+        // Update the event id.
+        let event_id = owned_event_id!("$1");
+        let num_updated =
+            self.update_dependent_send_queue_event(room_id, &txn0, event_id.clone()).await.unwrap();
+        assert_eq!(num_updated, 1);
+
+        // It worked.
+        let dependents = self.list_dependent_send_queue_events(room_id).await.unwrap();
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].parent_transaction_id, txn0);
+        assert_eq!(dependents[0].own_transaction_id, child_txn);
+        assert_eq!(dependents[0].event_id.as_ref(), Some(&event_id));
+        assert_matches!(dependents[0].kind, DependentQueuedEventKind::Redact);
+
+        // Now remove it.
+        let removed = self
+            .remove_dependent_send_queue_event(room_id, &dependents[0].own_transaction_id)
+            .await
+            .unwrap();
+        assert!(removed);
+
+        // It worked.
+        assert!(self.list_dependent_send_queue_events(room_id).await.unwrap().is_empty());
+
+        // Now, inserting a dependent event and removing the original send queue event
+        // will NOT remove the dependent event.
+        let txn1 = TransactionId::new();
+        let event1 =
+            SerializableEventContent::new(&RoomMessageEventContent::text_plain("hey2").into())
+                .unwrap();
+        self.save_send_queue_event(room_id, txn1.clone(), event1).await.unwrap();
+
+        self.save_dependent_send_queue_event(
+            room_id,
+            &txn0,
+            ChildTransactionId::new(),
+            DependentQueuedEventKind::Redact,
+        )
+        .await
+        .unwrap();
+        assert_eq!(self.list_dependent_send_queue_events(room_id).await.unwrap().len(), 1);
+
+        self.save_dependent_send_queue_event(
+            room_id,
+            &txn1,
+            ChildTransactionId::new(),
+            DependentQueuedEventKind::Edit {
+                new_content: SerializableEventContent::new(
+                    &RoomMessageEventContent::text_plain("edit").into(),
+                )
+                .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(self.list_dependent_send_queue_events(room_id).await.unwrap().len(), 2);
+
+        // Remove event0 / txn0.
+        let removed = self.remove_send_queue_event(room_id, &txn0).await.unwrap();
+        assert!(removed);
+
+        // This has removed none of the dependent events.
+        let dependents = self.list_dependent_send_queue_events(room_id).await.unwrap();
+        assert_eq!(dependents.len(), 2);
+    }
 }
 
 /// Macro building to allow your StateStore implementation to run the entire
@@ -1511,143 +1503,134 @@ impl StateStoreIntegrationTests for DynStateStore {
 #[allow(unused_macros, unused_extern_crates)]
 #[macro_export]
 macro_rules! statestore_integration_tests {
-    (with_media_tests) => {
-        mod statestore_integration_tests {
-            $crate::statestore_integration_tests!(@inner);
-
-            #[async_test]
-            async fn test_media_content() {
-                let store = get_store().await.unwrap().into_state_store();
-                store.test_media_content().await;
-            }
-        }
-    };
-
     () => {
         mod statestore_integration_tests {
-            $crate::statestore_integration_tests!(@inner);
-        }
-    };
+            use matrix_sdk_test::async_test;
+            use $crate::store::{
+                IntoStateStore, Result as StoreResult, StateStoreIntegrationTests,
+            };
 
-    (@inner) => {
-        use matrix_sdk_test::async_test;
+            use super::get_store;
 
-        use $crate::store::{IntoStateStore, Result as StoreResult, StateStoreIntegrationTests};
+            #[async_test]
+            async fn test_topic_redaction() -> StoreResult<()> {
+                let store = get_store().await?.into_state_store();
+                store.test_topic_redaction().await
+            }
 
-        use super::get_store;
+            #[async_test]
+            async fn test_populate_store() -> StoreResult<()> {
+                let store = get_store().await?.into_state_store();
+                store.test_populate_store().await
+            }
 
-        #[async_test]
-        async fn test_topic_redaction() -> StoreResult<()> {
-            let store = get_store().await?.into_state_store();
-            store.test_topic_redaction().await
-        }
+            #[async_test]
+            async fn test_member_saving() {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_member_saving().await
+            }
 
-        #[async_test]
-        async fn test_populate_store() -> StoreResult<()> {
-            let store = get_store().await?.into_state_store();
-            store.test_populate_store().await
-        }
+            #[async_test]
+            async fn test_filter_saving() {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_filter_saving().await
+            }
 
-        #[async_test]
-        async fn test_member_saving() {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_member_saving().await
-        }
+            #[async_test]
+            async fn test_user_avatar_url_saving() {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_user_avatar_url_saving().await
+            }
 
-        #[async_test]
-        async fn test_filter_saving() {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_filter_saving().await
-        }
+            #[async_test]
+            async fn test_server_capabilities_saving() {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_server_capabilities_saving().await
+            }
 
-        #[async_test]
-        async fn test_user_avatar_url_saving() {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_user_avatar_url_saving().await
-        }
+            #[async_test]
+            async fn test_sync_token_saving() {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_sync_token_saving().await
+            }
 
-        #[async_test]
-        async fn test_server_capabilities_saving() {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_server_capabilities_saving().await
-        }
+            #[async_test]
+            async fn test_utd_hook_manager_data_saving() {
+                let store = get_store().await.expect("creating store failed").into_state_store();
+                store.test_utd_hook_manager_data_saving().await;
+            }
 
-        #[async_test]
-        async fn test_sync_token_saving() {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_sync_token_saving().await
-        }
+            #[async_test]
+            async fn test_stripped_member_saving() {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_stripped_member_saving().await
+            }
 
-        #[async_test]
-        async fn test_utd_hook_manager_data_saving() {
-             let store = get_store().await.expect("creating store failed").into_state_store();
-             store.test_utd_hook_manager_data_saving().await;
-        }
+            #[async_test]
+            async fn test_power_level_saving() {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_power_level_saving().await
+            }
 
-        #[async_test]
-        async fn test_stripped_member_saving() {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_stripped_member_saving().await
-        }
+            #[async_test]
+            async fn test_receipts_saving() {
+                let store = get_store().await.expect("creating store failed").into_state_store();
+                store.test_receipts_saving().await;
+            }
 
-        #[async_test]
-        async fn test_power_level_saving() {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_power_level_saving().await
-        }
+            #[async_test]
+            async fn test_custom_storage() -> StoreResult<()> {
+                let store = get_store().await?.into_state_store();
+                store.test_custom_storage().await
+            }
 
-        #[async_test]
-        async fn test_receipts_saving() {
-            let store = get_store().await.expect("creating store failed").into_state_store();
-            store.test_receipts_saving().await;
-        }
+            #[async_test]
+            async fn test_persist_invited_room() -> StoreResult<()> {
+                let store = get_store().await?.into_state_store();
+                store.test_persist_invited_room().await
+            }
 
-        #[async_test]
-        async fn test_custom_storage() -> StoreResult<()> {
-            let store = get_store().await?.into_state_store();
-            store.test_custom_storage().await
-        }
+            #[async_test]
+            async fn test_stripped_non_stripped() -> StoreResult<()> {
+                let store = get_store().await.unwrap().into_state_store();
+                store.test_stripped_non_stripped().await
+            }
 
-        #[async_test]
-        async fn test_persist_invited_room() -> StoreResult<()> {
-            let store = get_store().await?.into_state_store();
-            store.test_persist_invited_room().await
-        }
+            #[async_test]
+            async fn test_room_removal() -> StoreResult<()> {
+                let store = get_store().await?.into_state_store();
+                store.test_room_removal().await
+            }
 
-        #[async_test]
-        async fn test_stripped_non_stripped() -> StoreResult<()> {
-            let store = get_store().await.unwrap().into_state_store();
-            store.test_stripped_non_stripped().await
-        }
+            #[async_test]
+            async fn test_profile_removal() -> StoreResult<()> {
+                let store = get_store().await?.into_state_store();
+                store.test_profile_removal().await
+            }
 
-        #[async_test]
-        async fn test_room_removal() -> StoreResult<()> {
-            let store = get_store().await?.into_state_store();
-            store.test_room_removal().await
-        }
+            #[async_test]
+            async fn test_presence_saving() {
+                let store = get_store().await.expect("creating store failed").into_state_store();
+                store.test_presence_saving().await;
+            }
 
-        #[async_test]
-        async fn test_profile_removal() -> StoreResult<()> {
-            let store = get_store().await?.into_state_store();
-            store.test_profile_removal().await
-        }
+            #[async_test]
+            async fn test_display_names_saving() {
+                let store = get_store().await.expect("creating store failed").into_state_store();
+                store.test_display_names_saving().await;
+            }
 
-        #[async_test]
-        async fn test_presence_saving() {
-            let store = get_store().await.expect("creating store failed").into_state_store();
-            store.test_presence_saving().await;
-        }
+            #[async_test]
+            async fn test_send_queue() {
+                let store = get_store().await.expect("creating store failed").into_state_store();
+                store.test_send_queue().await;
+            }
 
-        #[async_test]
-        async fn test_display_names_saving() {
-            let store = get_store().await.expect("creating store failed").into_state_store();
-            store.test_display_names_saving().await;
-        }
-
-        #[async_test]
-        async fn test_send_queue() {
-            let store = get_store().await.expect("creating store failed").into_state_store();
-            store.test_send_queue().await;
+            #[async_test]
+            async fn test_send_queue_dependents() {
+                let store = get_store().await.expect("creating store failed").into_state_store();
+                store.test_send_queue_dependents().await;
+            }
         }
     };
 }

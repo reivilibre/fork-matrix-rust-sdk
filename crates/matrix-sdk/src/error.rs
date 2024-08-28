@@ -24,7 +24,9 @@ use matrix_sdk_base::crypto::ScanError;
 use matrix_sdk_base::crypto::{
     CryptoStoreError, DecryptorError, KeyExportError, MegolmError, OlmError,
 };
-use matrix_sdk_base::{Error as SdkBaseError, RoomState, StoreError};
+use matrix_sdk_base::{
+    event_cache_store::EventCacheStoreError, Error as SdkBaseError, RoomState, StoreError,
+};
 use reqwest::Error as ReqwestError;
 use ruma::{
     api::{
@@ -304,6 +306,10 @@ pub enum Error {
     #[error(transparent)]
     StateStore(#[from] StoreError),
 
+    /// An error occurred in the event cache store.
+    #[error(transparent)]
+    EventCacheStore(#[from] EventCacheStoreError),
+
     /// An error encountered when trying to parse an identifier.
     #[error(transparent)]
     Identifier(#[from] IdParseError),
@@ -360,6 +366,10 @@ pub enum Error {
     /// An error coming from the event cache subsystem.
     #[error(transparent)]
     EventCache(#[from] EventCacheError),
+
+    /// Backups are not enabled
+    #[error("backups are not enabled")]
+    BackupNotEnabled,
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -500,6 +510,44 @@ pub enum ImageError {
     /// The thumbnail size is bigger than the original image.
     #[error("the thumbnail size is bigger than the original image size")]
     ThumbnailBiggerThanOriginal,
+}
+
+/// Errors that can happen when interacting with the beacon API.
+#[derive(Debug, Error)]
+pub enum BeaconError {
+    // A network error occurred.
+    #[error("Network error: {0}")]
+    Network(#[from] HttpError),
+
+    // The beacon information is not found.
+    #[error("Existing beacon information not found.")]
+    NotFound,
+
+    // The redacted event is not an error, but it's not useful for the client.
+    #[error("Beacon event is redacted and cannot be processed.")]
+    Redacted,
+
+    // The client must join the room to access the beacon information.
+    #[error("Must join the room to access beacon information.")]
+    Stripped,
+
+    // The beacon event could not be deserialized.
+    #[error("Deserialization error: {0}")]
+    Deserialization(#[from] serde_json::Error),
+
+    // The beacon event is expired.
+    #[error("The beacon event has expired.")]
+    NotLive,
+
+    // Allow for other errors to be wrapped.
+    #[error("Other error: {0}")]
+    Other(Box<Error>),
+}
+
+impl From<Error> for BeaconError {
+    fn from(err: Error) -> Self {
+        BeaconError::Other(Box::new(err))
+    }
 }
 
 /// Errors that can happen when refreshing an access token.
