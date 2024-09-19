@@ -10,7 +10,7 @@ use std::{
 use assert_matches2::{assert_let, assert_matches};
 use matrix_sdk::{
     config::{RequestConfig, StoreConfig},
-    send_queue::{LocalEcho, RoomSendQueueError, RoomSendQueueUpdate},
+    send_queue::{LocalEcho, LocalEchoContent, RoomSendQueueError, RoomSendQueueUpdate},
     test_utils::{
         events::EventFactory, logged_in_client, logged_in_client_with_server, set_client_session,
     },
@@ -25,7 +25,12 @@ use ruma::{
     api::MatrixVersion,
     event_id,
     events::{
-        room::message::RoomMessageEventContent, AnyMessageLikeEventContent, EventContent as _,
+        poll::unstable_start::{
+            NewUnstablePollStartEventContent, UnstablePollAnswer, UnstablePollAnswers,
+            UnstablePollStartContentBlock, UnstablePollStartEventContent,
+        },
+        room::message::RoomMessageEventContent,
+        AnyMessageLikeEventContent, EventContent as _,
     },
     room_id,
     serde::Raw,
@@ -68,11 +73,13 @@ macro_rules! assert_update {
     ($watch:ident => local echo { body = $body:expr }) => {{
         assert_let!(
             Ok(Ok(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
-                serialized_event,
+                content: LocalEchoContent::Event {
+                    serialized_event,
+                    send_handle,
+                    // New local echoes should always start as not wedged.
+                    is_wedged: false,
+                },
                 transaction_id: txn,
-                send_handle,
-                // New local echoes should always start as not wedged.
-                is_wedged: false,
             }))) = timeout(Duration::from_secs(1), $watch.recv()).await
         );
 
@@ -81,6 +88,26 @@ macro_rules! assert_update {
         assert_eq!(_msg.body(), $body);
 
         (txn, send_handle)
+    }};
+
+    // Check the next stream event is a local echo for a reaction with the content $key which
+    // applies to the local echo with transaction id $parent.
+    ($watch:ident => local reaction { key = $key:expr, parent = $parent_txn_id:expr }) => {{
+        assert_let!(
+            Ok(Ok(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
+                content: LocalEchoContent::React {
+                    key,
+                    applies_to,
+                    send_handle: _,
+                },
+                transaction_id: txn,
+            }))) = timeout(Duration::from_secs(1), $watch.recv()).await
+        );
+
+        assert_eq!(key, $key);
+        assert_eq!(applies_to, $parent_txn_id);
+
+        txn
     }};
 
     // Check the next stream event is an edit for a local echo with the content $body, and that the
@@ -99,6 +126,16 @@ macro_rules! assert_update {
 
         assert_eq!(txn, $transaction_id);
     }};
+
+    // Check the next stream event is a retry event, with optional checks on txn=$txn
+    ($watch:ident => retry { $(txn=$txn:expr)? }) => {
+        assert_let!(
+            Ok(Ok(RoomSendQueueUpdate::RetryEvent { transaction_id: _txn })) =
+                timeout(Duration::from_secs(1), $watch.recv()).await
+        );
+
+        $(assert_eq!(_txn, $txn);)?
+    };
 
     // Check the next stream event is a sent event, with optional checks on txn=$txn and
     // event_id=$event_id.
@@ -338,9 +375,8 @@ async fn test_smoke_raw() {
 
     assert_let!(
         Ok(Ok(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
-            serialized_event,
+            content: LocalEchoContent::Event { serialized_event, .. },
             transaction_id: txn1,
-            ..
         }))) = timeout(Duration::from_secs(1), watch.recv()).await
     );
 
@@ -758,7 +794,8 @@ async fn test_cancellation() {
     // Let the background task start now.
     tokio::task::yield_now().await;
 
-    // While the first item is being sent, the system records the intent to edit it.
+    // While the first item is being sent, the system records the intent to abort
+    // it.
     assert!(handle1.abort().await.unwrap());
     assert_update!(watch => cancelled { txn = txn1 });
     assert!(watch.is_empty());
@@ -785,8 +822,9 @@ async fn test_cancellation() {
     let local_echo4 = local_echoes.remove(1);
     assert_eq!(local_echo4.transaction_id, txn4, "local echoes: {local_echoes:?}");
 
-    let handle4 = local_echo4.send_handle;
-
+    let LocalEchoContent::Event { send_handle: handle4, .. } = local_echo4.content else {
+        panic!("unexpected local echo content");
+    };
     assert!(handle4.abort().await.unwrap());
     assert_update!(watch => cancelled { txn = txn4 });
     assert!(watch.is_empty());
@@ -807,10 +845,6 @@ async fn test_edit() {
     // would work here too similarly.
 
     let (client, server) = logged_in_client_with_server().await;
-
-    // TODO: (#3722) if the event cache isn't available, then making the edit event
-    // will fail.
-    client.event_cache().subscribe().unwrap();
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
@@ -929,12 +963,153 @@ async fn test_edit() {
 }
 
 #[async_test]
-async fn test_edit_while_being_sent_and_fails() {
+async fn test_edit_with_poll_start() {
     let (client, server) = logged_in_client_with_server().await;
 
-    // TODO: (#3722) if the event cache isn't available, then making the edit event
-    // will fail.
-    client.event_cache().subscribe().unwrap();
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+
+    let room = mock_sync_with_new_room(
+        |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+        },
+        &client,
+        &server,
+        room_id,
+    )
+    .await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+
+    assert!(local_echoes.is_empty());
+    assert!(watch.is_empty());
+
+    let lock = Arc::new(Mutex::new(()));
+    let lock_guard = lock.lock().await;
+
+    let mock_lock = lock.clone();
+
+    mock_encryption_state(&server, false).await;
+
+    let num_request = std::sync::Mutex::new(1);
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(move |_req: &Request| {
+            // Wait for the signal from the main thread that we can process this query.
+            let mock_lock = mock_lock.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    drop(mock_lock.lock().await);
+                });
+            })
+            .join()
+            .unwrap();
+
+            let mut num_request = num_request.lock().unwrap();
+
+            let event_id = format!("${}", *num_request);
+            *num_request += 1;
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": event_id,
+            }))
+        })
+        .named("send_event")
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // The /event endpoint is used to retrieve the original event, during creation
+    // of the edit event.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/event/"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                EventFactory::new()
+                    .poll_start("poll_start", "question", vec!["Answer A"])
+                    .sender(client.user_id().unwrap())
+                    .room(room_id)
+                    .into_raw_timeline()
+                    .json(),
+            ),
+        )
+        .expect(1)
+        .named("get_event")
+        .mount(&server)
+        .await;
+
+    let poll_answers: UnstablePollAnswers =
+        vec![UnstablePollAnswer::new("A", "Answer A")].try_into().unwrap();
+    let poll_start_block = UnstablePollStartContentBlock::new("question", poll_answers);
+    let poll_start_content = UnstablePollStartEventContent::New(
+        NewUnstablePollStartEventContent::plain_text("poll_start", poll_start_block),
+    );
+    let handle = q.send(poll_start_content.into()).await.unwrap();
+
+    // Receiving updates for local echoes.
+    assert_let!(
+        Ok(Ok(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
+            content: LocalEchoContent::Event {
+                serialized_event,
+                // New local echoes should always start as not wedged.
+                is_wedged: false,
+                ..
+            },
+            transaction_id: txn1,
+        }))) = timeout(Duration::from_secs(1), watch.recv()).await
+    );
+
+    let content = serialized_event.deserialize().unwrap();
+    assert_let!(AnyMessageLikeEventContent::UnstablePollStart(_) = content);
+    assert!(watch.is_empty());
+
+    // Let the background task start now.
+    tokio::task::yield_now().await;
+
+    // Edit the poll start event
+    let poll_answers: UnstablePollAnswers =
+        vec![UnstablePollAnswer::new("B", "Answer B")].try_into().unwrap();
+    let poll_start_block = UnstablePollStartContentBlock::new("edited question", poll_answers);
+    let poll_start_content = UnstablePollStartEventContent::New(
+        NewUnstablePollStartEventContent::plain_text("poll_start (edited)", poll_start_block),
+    );
+    assert!(handle.edit(poll_start_content.into()).await.unwrap());
+
+    assert_let!(
+        Ok(Ok(RoomSendQueueUpdate::ReplacedLocalEvent {
+            transaction_id: new_txn1,
+            new_content: serialized_event,
+        })) = timeout(Duration::from_secs(1), watch.recv()).await
+    );
+    let content = serialized_event.deserialize().unwrap();
+    assert_let!(
+        AnyMessageLikeEventContent::UnstablePollStart(UnstablePollStartEventContent::New(
+            poll_start
+        )) = content
+    );
+    assert_eq!(poll_start.text.unwrap(), "poll_start (edited)");
+    assert_eq!(txn1, new_txn1);
+    assert!(watch.is_empty());
+
+    // Let the server process the responses.
+    drop(lock_guard);
+
+    // Now the server will process the events in order.
+    assert_update!(watch => sent { txn = txn1, });
+
+    // Let a bit of time to process the edit event sent to the server for txn1.
+    assert_update!(watch => sent {});
+
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_edit_while_being_sent_and_fails() {
+    let (client, server) = logged_in_client_with_server().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
@@ -1014,7 +1189,11 @@ async fn test_edit_while_being_sent_and_fails() {
     assert_eq!(local_echoes.len(), 1);
     assert_eq!(local_echoes[0].transaction_id, txn1);
 
-    let event = local_echoes[0].serialized_event.deserialize().unwrap();
+    let LocalEchoContent::Event { serialized_event, .. } = &local_echoes[0].content else {
+        panic!("unexpected local echo content")
+    };
+    let event = serialized_event.deserialize().unwrap();
+
     assert_let!(AnyMessageLikeEventContent::RoomMessage(msg) = event);
     assert_eq!(msg.body(), "it's never too late!");
 }
@@ -1197,6 +1376,8 @@ async fn test_abort_or_edit_after_send() {
         .not());
     // Neither will aborting.
     assert!(handle.abort().await.unwrap().not());
+    // Or sending a reaction.
+    assert!(handle.react("😊".to_owned()).await.unwrap().is_none());
 
     assert!(watch.is_empty());
 }
@@ -1370,6 +1551,97 @@ async fn test_unrecoverable_errors() {
 }
 
 #[async_test]
+async fn test_unwedge_unrecoverable_errors() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+
+    let room = mock_sync_with_new_room(
+        |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+        },
+        &client,
+        &server,
+        room_id,
+    )
+    .await;
+
+    let mut errors = client.send_queue().subscribe_errors();
+
+    assert!(errors.is_empty());
+
+    // Start with an enabled sending queue.
+    client.send_queue().set_enabled(true).await;
+
+    assert!(client.send_queue().is_enabled());
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+
+    assert!(local_echoes.is_empty());
+    assert!(watch.is_empty());
+
+    server.reset().await;
+
+    mock_encryption_state(&server, false).await;
+
+    let respond_with_unrecoverable = AtomicBool::new(true);
+
+    // Respond to the first /send with an unrecoverable error.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(move |_req: &Request| {
+            // The first message gets M_TOO_LARGE, subsequent messages will encounter a
+            // great success.
+            if respond_with_unrecoverable.swap(false, Ordering::SeqCst) {
+                ResponseTemplate::new(413).set_body_json(json!({
+                    // From https://spec.matrix.org/v1.10/client-server-api/#standard-error-response
+                    "errcode": "M_TOO_LARGE",
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "event_id": "$42",
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // Queue the unrecoverable message.
+    q.send(RoomMessageEventContent::text_plain("i'm too big for ya").into()).await.unwrap();
+
+    // Message is seen as a local echo.
+    let (txn1, _) = assert_update!(watch => local echo { body = "i'm too big for ya" });
+
+    // There will be an error report for the first message, indicating that the
+    // error is unrecoverable.
+    let report = errors.recv().await.unwrap();
+    assert_eq!(report.room_id, room.room_id());
+    assert!(!report.is_recoverable);
+
+    // The room updates will report the error for the first message as unrecoverable
+    // too.
+    assert_update!(watch => error { recoverable=false, txn=txn1 });
+
+    // No queue is being disabled, because the error was unrecoverable.
+    assert!(room.send_queue().is_enabled());
+    assert!(client.send_queue().is_enabled());
+
+    // Unwedge the previously failed message and try sending it again
+    q.unwedge(&txn1).await.unwrap();
+
+    // The message should be retried
+    assert_update!(watch => retry { txn=txn1 });
+
+    // Then eventually sent and a remote echo received
+    assert_update!(watch => sent { txn=txn1, event_id=event_id!("$42") });
+}
+
+#[async_test]
 async fn test_no_network_access_error_is_recoverable() {
     // This is subtle, but for the `drop(server)` below to be effectful, it needs to
     // not be a pooled wiremock server (the default), which will keep the dropped
@@ -1534,4 +1806,143 @@ async fn test_reloading_rooms_with_unsent_events() {
 
     // The real assertion is on the expect(2) on the above Mock.
     server.verify().await;
+}
+
+#[async_test]
+async fn test_reactions() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+
+    let room = mock_sync_with_new_room(
+        |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+        },
+        &client,
+        &server,
+        room_id,
+    )
+    .await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+    assert!(watch.is_empty());
+
+    let lock = Arc::new(Mutex::new(0));
+    let lock_guard = lock.lock().await;
+
+    let mock_lock = lock.clone();
+
+    mock_encryption_state(&server, false).await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(move |_req: &Request| {
+            // Wait for the signal from the main thread that we can process this query.
+            let mock_lock = mock_lock.clone();
+            let event_id = std::thread::spawn(move || {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let mut event_id = mock_lock.lock().await;
+                    let ret = *event_id;
+                    *event_id += 1;
+                    ret
+                })
+            })
+            .join()
+            .unwrap();
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": format!("${event_id}"),
+            }))
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    // Sending of the second emoji has started; abort it, it will result in a redact
+    // request.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/redact/.*?/.*?"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$3"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Send a message.
+    let msg_handle =
+        room.send_queue().send(RoomMessageEventContent::text_plain("1").into()).await.unwrap();
+
+    // React to it a few times.
+    let emoji_handle =
+        msg_handle.react("💯".to_owned()).await.unwrap().expect("first emoji was queued");
+    let emoji_handle2 =
+        msg_handle.react("🍭".to_owned()).await.unwrap().expect("second emoji was queued");
+    let emoji_handle3 =
+        msg_handle.react("👍".to_owned()).await.unwrap().expect("fourth emoji was queued");
+
+    let (txn1, _) = assert_update!(watch => local echo { body = "1" });
+    let emoji1_txn = assert_update!(watch => local reaction { key = "💯", parent = txn1 });
+    let emoji2_txn = assert_update!(watch => local reaction { key = "🍭", parent = txn1 });
+    let emoji3_txn = assert_update!(watch => local reaction { key = "👍", parent = txn1 });
+
+    {
+        let (local_echoes, _) = q.subscribe().await.unwrap();
+
+        assert_eq!(local_echoes.len(), 4);
+        assert_eq!(local_echoes[0].transaction_id, txn1);
+
+        assert_eq!(local_echoes[1].transaction_id, emoji1_txn);
+        assert_let!(LocalEchoContent::React { key, applies_to, .. } = &local_echoes[1].content);
+        assert_eq!(key, "💯");
+        assert_eq!(*applies_to, txn1);
+
+        assert_eq!(local_echoes[2].transaction_id, emoji2_txn);
+        assert_let!(LocalEchoContent::React { key, applies_to, .. } = &local_echoes[2].content);
+        assert_eq!(key, "🍭");
+        assert_eq!(*applies_to, txn1);
+
+        assert_eq!(local_echoes[3].transaction_id, emoji3_txn);
+        assert_let!(LocalEchoContent::React { key, applies_to, .. } = &local_echoes[3].content);
+        assert_eq!(key, "👍");
+        assert_eq!(*applies_to, txn1);
+    }
+
+    // Cancel the first reaction before the original event is sent.
+    let aborted = emoji_handle.abort().await.unwrap();
+    assert!(aborted);
+    assert_update!(watch => cancelled { txn = emoji1_txn });
+    assert!(watch.is_empty());
+
+    // Let the original event be sent, and re-take the lock immediately so no
+    // reactions aren't sent (since the lock is fair).
+    drop(lock_guard);
+    assert_update!(watch => sent { txn = txn1, event_id = event_id!("$0") });
+    let lock_guard = lock.lock().await;
+    assert!(watch.is_empty());
+
+    // Abort sending of the second emoji. It was being sent, so it's first cancelled
+    // *then* sent and redacted.
+    let aborted = emoji_handle2.abort().await.unwrap();
+    assert!(aborted);
+    assert_update!(watch => cancelled { txn = emoji2_txn });
+    assert!(watch.is_empty());
+
+    // Drop the guard to let the mock server process events.
+    drop(lock_guard);
+
+    // Previous emoji has been sent; it will be redacted later.
+    assert_update!(watch => sent { txn = emoji2_txn, event_id = event_id!("$1") });
+
+    // The final emoji is sent.
+    assert_update!(watch => sent { txn = emoji3_txn, event_id = event_id!("$2") });
+
+    // Cancelling sending of the third emoji fails because it's been sent already.
+    assert!(emoji_handle3.abort().await.unwrap().not());
+
+    assert!(watch.is_empty());
 }

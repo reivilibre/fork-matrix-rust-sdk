@@ -95,26 +95,12 @@ pub enum SenderData {
 impl SenderData {
     /// Create a [`SenderData`] which contains no device info.
     pub fn unknown() -> Self {
-        Self::UnknownDevice {
-            // TODO: when we have implemented all of SenderDataFinder,
-            // legacy_session should be set to false, but for now we leave
-            // it as true because we might lose device info while
-            // this code is still in transition.
-            legacy_session: true,
-            owner_check_failed: false,
-        }
+        Self::UnknownDevice { legacy_session: false, owner_check_failed: false }
     }
 
     /// Create a [`SenderData`] which contains device info.
     pub fn device_info(device_keys: DeviceKeys) -> Self {
-        Self::DeviceInfo {
-            device_keys,
-            // TODO: when we have implemented all of SenderDataFinder,
-            // legacy_session should be set to false, but for now we leave
-            // it as true because we might lose device info while
-            // this code is still in transition.
-            legacy_session: true,
-        }
+        Self::DeviceInfo { device_keys, legacy_session: false }
     }
 
     /// Create a [`SenderData`] with a known but unverified sender, where the
@@ -191,14 +177,26 @@ impl SenderData {
             SenderData::SenderVerified(..) => 4,
         }
     }
+
+    /// Return our type as a [`SenderDataType`].
+    pub fn to_type(&self) -> SenderDataType {
+        match self {
+            Self::UnknownDevice { .. } => SenderDataType::UnknownDevice,
+            Self::DeviceInfo { .. } => SenderDataType::DeviceInfo,
+            Self::SenderUnverifiedButPreviouslyVerified { .. } => {
+                SenderDataType::SenderUnverifiedButPreviouslyVerified
+            }
+            Self::SenderUnverified { .. } => SenderDataType::SenderUnverified,
+            Self::SenderVerified { .. } => SenderDataType::SenderVerified,
+        }
+    }
 }
 
 /// Used when deserialising and the sender_data property is missing.
 /// If we are deserialising an InboundGroupSession session with missing
 /// sender_data, this must be a legacy session (i.e. it was created before we
-/// started tracking sender data). We set its legacy flag to true, and set it up
-/// to be retried soon, so we can populate it with trust information if it is
-/// available.
+/// started tracking sender data). We set its legacy flag to true, so we can
+/// populate it with trust information if it is available later.
 impl Default for SenderData {
     fn default() -> Self {
         Self::legacy()
@@ -264,6 +262,23 @@ impl From<SenderDataReader> for SenderData {
             }
         }
     }
+}
+
+/// Used when serializing [`crate::olm::group_sessions::InboundGroupSession`]s.
+/// We want just the type of the session's [`SenderData`] to be queryable, so we
+/// store the type as a separate column/property in the database.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+pub enum SenderDataType {
+    /// The [`SenderData`] is of type `UnknownDevice`.
+    UnknownDevice = 1,
+    /// The [`SenderData`] is of type `DeviceInfo`.
+    DeviceInfo = 2,
+    /// The [`SenderData`] is of type `SenderUnverifiedButPreviouslyVerified`.
+    SenderUnverifiedButPreviouslyVerified = 3,
+    /// The [`SenderData`] is of type `SenderUnverified`.
+    SenderUnverified = 4,
+    /// The [`SenderData`] is of type `SenderVerified`.
+    SenderVerified = 5,
 }
 
 #[cfg(test)]

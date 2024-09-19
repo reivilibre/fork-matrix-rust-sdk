@@ -449,18 +449,8 @@ impl VerificationRequest {
             .get_qr(qr_verification.other_user_id(), qr_verification.flow_id().as_str())
             .is_some()
         {
-            debug!(
-                user_id = ?self.other_user(),
-                flow_id = self.flow_id().as_str(),
-                "Replacing existing QR verification"
-            );
             self.verification_cache.replace_qr(qr_verification.clone());
         } else {
-            debug!(
-                user_id = ?self.other_user(),
-                flow_id = self.flow_id().as_str(),
-                "Inserting new QR verification"
-            );
             self.verification_cache.insert_qr(qr_verification.clone());
         }
 
@@ -1347,6 +1337,7 @@ async fn receive_start<T: Clone>(
     info!(
         ?sender,
         device = ?content.from_device(),
+        method = ?content.method(),
         "Received a new verification start event",
     );
 
@@ -1447,7 +1438,7 @@ async fn receive_start<T: Clone>(
                 if let Some(request) = qr_verification.receive_reciprocation(content) {
                     request_state.verification_cache.add_request(request.into())
                 }
-                trace!(
+                debug!(
                     sender = ?identities.device_being_verified.user_id(),
                     device_id = ?identities.device_being_verified.device_id(),
                     verification = ?qr_verification,
@@ -1456,6 +1447,7 @@ async fn receive_start<T: Clone>(
 
                 Ok(None)
             } else {
+                warn!("Received a QR code reciprocation for an unknown flow");
                 Ok(None)
             }
         }
@@ -1828,7 +1820,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn can_scan_another_qr_after_creating_mine() {
+    async fn test_can_scan_another_qr_after_creating_mine() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
@@ -1879,7 +1871,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn can_start_sas_after_generating_qr_code() {
+    async fn test_can_start_sas_after_generating_qr_code() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
@@ -1924,7 +1916,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn start_sas_after_scan_cancels_request() {
+    async fn test_start_sas_after_scan_cancels_request() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests

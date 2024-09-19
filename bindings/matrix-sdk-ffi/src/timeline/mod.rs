@@ -26,7 +26,8 @@ use matrix_sdk::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
         BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
     },
-    deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode},
+    deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
+    room::edit::EditedContent as SdkEditedContent,
     Error,
 };
 use matrix_sdk_ui::timeline::{
@@ -45,7 +46,6 @@ use ruma::{
             },
         },
         receipt::ReceiptThread,
-        relation::Annotation,
         room::message::{
             ForwardThread, LocationMessageEventContent, MessageType,
             RoomMessageEventContentWithoutRelation,
@@ -489,25 +489,10 @@ impl Timeline {
     pub async fn edit(
         &self,
         item: Arc<EventTimelineItem>,
-        new_content: Arc<RoomMessageEventContentWithoutRelation>,
+        new_content: EditedContent,
     ) -> Result<bool, ClientError> {
-        self.inner.edit(&item.0, (*new_content).clone()).await.map_err(ClientError::from)
-    }
-
-    pub async fn edit_poll(
-        &self,
-        question: String,
-        answers: Vec<String>,
-        max_selections: u8,
-        poll_kind: PollKind,
-        edit_item: Arc<EventTimelineItem>,
-    ) -> Result<(), ClientError> {
-        let poll_data = PollData { question, answers, max_selections, poll_kind };
-        self.inner
-            .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &edit_item.0)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-        Ok(())
+        let new_content: SdkEditedContent = new_content.try_into()?;
+        self.inner.edit(&item.0, new_content).await.map_err(ClientError::from)
     }
 
     pub async fn send_location(
@@ -538,9 +523,21 @@ impl Timeline {
         let _ = self.send(Arc::new(room_message_event_content)).await;
     }
 
-    pub async fn toggle_reaction(&self, event_id: String, key: String) -> Result<(), ClientError> {
-        let event_id = EventId::parse(event_id)?;
-        self.inner.toggle_reaction(&Annotation::new(event_id, key)).await?;
+    /// Toggle a reaction on an event.
+    ///
+    /// The `unique_id` parameter is a string returned by
+    /// the `TimelineItem::unique_id()` method. As such, this method works both
+    /// on local echoes and remote items.
+    ///
+    /// Adds or redacts a reaction based on the state of the reaction at the
+    /// time it is called.
+    ///
+    /// When redacting a previous reaction, the redaction reason is not set.
+    ///
+    /// Ensures that only one reaction is sent at a time to avoid race
+    /// conditions and spamming the homeserver with requests.
+    pub async fn toggle_reaction(&self, unique_id: String, key: String) -> Result<(), ClientError> {
+        self.inner.toggle_reaction(&unique_id, &key).await?;
         Ok(())
     }
 
@@ -918,11 +915,20 @@ pub enum EventSendState {
     ///
     /// Happens only when the room key recipient strategy (as set by
     /// [`ClientBuilder::room_key_recipient_strategy`]) has
-    /// [`error_on_verified_user_problem`](CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem) set.
+    /// [`error_on_verified_user_problem`](CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem)
+    /// set, or when using [`CollectStrategy::IdentityBasedStrategy`].
     VerifiedUserChangedIdentity {
         /// The users that were previously verified, but are no longer
         users: Vec<String>,
     },
+
+    /// The user does not have cross-signing set up, but
+    /// [`CollectStrategy::IdentityBasedStrategy`] was used.
+    CrossSigningNotSetup,
+
+    /// The current device is not verified, but
+    /// [`CollectStrategy::IdentityBasedStrategy`] was used.
+    SendingFromUnverifiedDevice,
 
     /// The local event has been sent to the server, but unsuccessfully: The
     /// sending has failed.
@@ -977,6 +983,10 @@ fn event_send_state_from_sending_failed(error: &Error, is_recoverable: bool) -> 
             VerifiedUserChangedIdentity(bad_users) => EventSendState::VerifiedUserChangedIdentity {
                 users: bad_users.iter().map(|user_id| user_id.to_string()).collect(),
             },
+
+            CrossSigningNotSetup => EventSendState::CrossSigningNotSetup,
+
+            SendingFromUnverifiedDevice => EventSendState::SendingFromUnverifiedDevice,
         },
 
         _ => EventSendState::SendingFailed { error: error.to_string(), is_recoverable },
@@ -997,16 +1007,16 @@ pub enum ShieldState {
     None,
 }
 
-impl From<RustShieldState> for ShieldState {
-    fn from(value: RustShieldState) -> Self {
+impl From<SdkShieldState> for ShieldState {
+    fn from(value: SdkShieldState) -> Self {
         match value {
-            RustShieldState::Red { code, message } => {
+            SdkShieldState::Red { code, message } => {
                 Self::Red { code, message: message.to_owned() }
             }
-            RustShieldState::Grey { code, message } => {
+            SdkShieldState::Grey { code, message } => {
                 Self::Grey { code, message: message.to_owned() }
             }
-            RustShieldState::None => Self::None,
+            SdkShieldState::None => Self::None,
         }
     }
 }
@@ -1145,7 +1155,8 @@ impl From<&TimelineDetails<Profile>> for ProfileDetails {
     }
 }
 
-struct PollData {
+#[derive(Clone, uniffi::Record)]
+pub struct PollData {
     question: String,
     answers: Vec<String>,
     max_selections: u8,
@@ -1237,6 +1248,30 @@ impl From<ReceiptType> for ruma::api::client::receipt::create_receipt::v3::Recei
             ReceiptType::Read => Self::Read,
             ReceiptType::ReadPrivate => Self::ReadPrivate,
             ReceiptType::FullyRead => Self::FullyRead,
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum EditedContent {
+    RoomMessage { content: Arc<RoomMessageEventContentWithoutRelation> },
+    PollStart { poll_data: PollData },
+}
+
+impl TryFrom<EditedContent> for SdkEditedContent {
+    type Error = ClientError;
+    fn try_from(value: EditedContent) -> Result<Self, Self::Error> {
+        match value {
+            EditedContent::RoomMessage { content } => {
+                Ok(SdkEditedContent::RoomMessage((*content).clone()))
+            }
+            EditedContent::PollStart { poll_data } => {
+                let block: UnstablePollStartContentBlock = poll_data.clone().try_into()?;
+                Ok(SdkEditedContent::PollStart {
+                    fallback_text: poll_data.fallback_text(),
+                    new_content: block,
+                })
+            }
         }
     }
 }

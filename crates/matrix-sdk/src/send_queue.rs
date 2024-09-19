@@ -61,7 +61,7 @@ use matrix_sdk_base::{
 use matrix_sdk_common::executor::{spawn, JoinHandle};
 use ruma::{
     events::{
-        room::message::RoomMessageEventContentWithoutRelation, AnyMessageLikeEventContent,
+        reaction::ReactionEventContent, relation::Annotation, AnyMessageLikeEventContent,
         EventContent as _,
     },
     serde::Raw,
@@ -265,6 +265,7 @@ pub struct RoomSendQueue {
     inner: Arc<RoomSendQueueInner>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for RoomSendQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RoomSendQueue").finish_non_exhaustive()
@@ -343,9 +344,14 @@ impl RoomSendQueue {
 
         let _ = self.inner.updates.send(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
             transaction_id: transaction_id.clone(),
-            serialized_event: content,
-            send_handle: SendHandle { room: self.clone(), transaction_id: transaction_id.clone() },
-            is_wedged: false,
+            content: LocalEchoContent::Event {
+                serialized_event: content,
+                send_handle: SendHandle {
+                    room: self.clone(),
+                    transaction_id: transaction_id.clone(),
+                },
+                is_wedged: false,
+            },
         }));
 
         Ok(SendHandle { transaction_id, room: self.clone() })
@@ -381,22 +387,7 @@ impl RoomSendQueue {
         &self,
     ) -> Result<(Vec<LocalEcho>, broadcast::Receiver<RoomSendQueueUpdate>), RoomSendQueueError>
     {
-        let local_echoes = self
-            .inner
-            .queue
-            .local_echoes()
-            .await?
-            .into_iter()
-            .map(|queued| LocalEcho {
-                transaction_id: queued.transaction_id.clone(),
-                serialized_event: queued.event,
-                send_handle: SendHandle {
-                    room: self.clone(),
-                    transaction_id: queued.transaction_id,
-                },
-                is_wedged: queued.is_wedged,
-            })
-            .collect();
+        let local_echoes = self.inner.queue.local_echoes(self).await?;
 
         Ok((local_echoes, self.inner.updates.subscribe()))
     }
@@ -487,7 +478,10 @@ impl RoomSendQueue {
                     let is_recoverable = match err {
                         crate::Error::Http(ref http_err) => {
                             // All transient errors are recoverable.
-                            matches!(http_err.retry_kind(), RetryKind::Transient { .. })
+                            matches!(
+                                http_err.retry_kind(),
+                                RetryKind::Transient { .. } | RetryKind::NetworkFailure
+                            )
                         }
 
                         // `ConcurrentRequestFailed` typically happens because of an HTTP failure;
@@ -561,6 +555,26 @@ impl RoomSendQueue {
             self.inner.notifier.notify_one();
         }
     }
+
+    /// Unwedge a local echo identified by its transaction identifier and try to
+    /// resend it.
+    pub async fn unwedge(&self, transaction_id: &TransactionId) -> Result<(), RoomSendQueueError> {
+        self.inner
+            .queue
+            .mark_as_unwedged(transaction_id)
+            .await
+            .map_err(RoomSendQueueError::StorageError)?;
+
+        // Wake up the queue, in case the room was asleep before unwedging the event.
+        self.inner.notifier.notify_one();
+
+        let _ = self
+            .inner
+            .updates
+            .send(RoomSendQueueUpdate::RetryEvent { transaction_id: transaction_id.to_owned() });
+
+        Ok(())
+    }
 }
 
 struct RoomSendQueueInner {
@@ -577,12 +591,6 @@ struct RoomSendQueueInner {
     /// When an event has been sent to the server, it is removed from that queue
     /// *after* being sent. That way, we will retry sending upon failure, in
     /// the same order events have been inserted in the first place.
-    ///
-    /// In the future, this will be replaced by a database, and this field may
-    /// be removed. Instead of appending to that queue / updating its
-    /// content / deleting entries, all that will be required will be to
-    /// manipulate the on-disk storage. In other words, the storage will become
-    /// the one source of truth.
     queue: QueueStorage,
 
     /// A notifier that's updated any time common data is touched (stopped or
@@ -681,6 +689,19 @@ impl QueueStorage {
             .client()?
             .store()
             .update_send_queue_event_status(&self.room_id, transaction_id, true)
+            .await?)
+    }
+
+    /// Marks an event identified with the given transaction id as being now
+    /// unwedged and adds it back to the queue.
+    async fn mark_as_unwedged(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<(), RoomSendQueueStorageError> {
+        Ok(self
+            .client()?
+            .store()
+            .update_send_queue_event_status(&self.room_id, transaction_id, false)
             .await?)
     }
 
@@ -785,22 +806,95 @@ impl QueueStorage {
         Ok(edited)
     }
 
+    #[instrument(skip(self))]
+    async fn react(
+        &self,
+        transaction_id: &TransactionId,
+        key: String,
+    ) -> Result<Option<ChildTransactionId>, RoomSendQueueStorageError> {
+        let client = self.client()?;
+        let store = client.store();
+
+        let queued_events = store.load_send_queue_events(&self.room_id).await?;
+
+        // If the event has been already sent, abort immediately.
+        if !queued_events.iter().any(|item| item.transaction_id == transaction_id) {
+            return Ok(None);
+        }
+
+        // Record the dependent event.
+        let reaction_txn_id = ChildTransactionId::new();
+        store
+            .save_dependent_send_queue_event(
+                &self.room_id,
+                transaction_id,
+                reaction_txn_id.clone(),
+                DependentQueuedEventKind::React { key },
+            )
+            .await?;
+
+        Ok(Some(reaction_txn_id))
+    }
+
     /// Returns a list of the local echoes, that is, all the events that we're
     /// about to send but that haven't been sent yet (or are being sent).
-    async fn local_echoes(&self) -> Result<Vec<QueuedEvent>, RoomSendQueueStorageError> {
-        Ok(self.client()?.store().load_send_queue_events(&self.room_id).await?)
+    async fn local_echoes(
+        &self,
+        room: &RoomSendQueue,
+    ) -> Result<Vec<LocalEcho>, RoomSendQueueStorageError> {
+        let client = self.client()?;
+        let store = client.store();
+
+        let local_events =
+            store.load_send_queue_events(&self.room_id).await?.into_iter().map(|queued| {
+                LocalEcho {
+                    transaction_id: queued.transaction_id.clone(),
+                    content: LocalEchoContent::Event {
+                        serialized_event: queued.event,
+                        send_handle: SendHandle {
+                            room: room.clone(),
+                            transaction_id: queued.transaction_id,
+                        },
+                        is_wedged: queued.is_wedged,
+                    },
+                }
+            });
+
+        let local_reactions = store
+            .list_dependent_send_queue_events(&self.room_id)
+            .await?
+            .into_iter()
+            .filter_map(|dep| match dep.kind {
+                DependentQueuedEventKind::Edit { .. } | DependentQueuedEventKind::Redact => None,
+                DependentQueuedEventKind::React { key } => Some(LocalEcho {
+                    transaction_id: dep.own_transaction_id.clone().into(),
+                    content: LocalEchoContent::React {
+                        key,
+                        send_handle: SendReactionHandle {
+                            room: room.clone(),
+                            transaction_id: dep.own_transaction_id,
+                        },
+                        applies_to: dep.parent_transaction_id,
+                    },
+                }),
+            });
+
+        Ok(local_events.chain(local_reactions).collect())
     }
 
     /// Try to apply a single dependent event, whether it's local or remote.
     ///
     /// This swallows errors that would retrigger every time if we retried
     /// applying the dependent event: invalid edit content, etc.
+    ///
+    /// Returns true if the dependent event has been sent (or should not be
+    /// retried later).
     #[instrument(skip_all)]
     async fn try_apply_single_dependent_event(
         &self,
         client: &Client,
         de: DependentQueuedEvent,
-    ) -> Result<(), RoomSendQueueError> {
+    ) -> Result<bool, RoomSendQueueError> {
         let store = client.store();
 
         match de.kind {
@@ -813,34 +907,37 @@ impl QueueStorage {
 
                     // Check the event is one we know how to edit with an edit event.
 
-                    // 1. It must be deserializable…
-                    let content = match new_content.deserialize() {
-                        Ok(c) => c,
+                    // It must be deserializable…
+                    let edited_content = match new_content.deserialize() {
+                        Ok(AnyMessageLikeEventContent::RoomMessage(c)) => {
+                            // Assume no relationships.
+                            EditedContent::RoomMessage(c.into())
+                        }
+
+                        Ok(AnyMessageLikeEventContent::UnstablePollStart(c)) => {
+                            let poll_start = c.poll_start().clone();
+                            EditedContent::PollStart {
+                                fallback_text: poll_start.question.text.clone(),
+                                new_content: poll_start,
+                            }
+                        }
+
+                        Ok(c) => {
+                            warn!("Unsupported edit content type: {:?}", c.event_type());
+                            return Ok(true);
+                        }
+
                         Err(err) => {
-                            warn!("unable to deserialize: {err}");
-                            return Ok(());
+                            warn!("Unable to deserialize: {err}");
+                            return Ok(true);
                         }
                     };
 
-                    // 2. …and a room message, at this point.
-                    let AnyMessageLikeEventContent::RoomMessage(room_message_content) = content
-                    else {
-                        warn!("trying to send an edit event for a non-room message: aborting");
-                        return Ok(());
-                    };
-
-                    // Assume no relation.
-                    let new_content: RoomMessageEventContentWithoutRelation =
-                        room_message_content.into();
-
-                    let edit_event = match room
-                        .make_edit_event(&event_id, EditedContent::RoomMessage(new_content))
-                        .await
-                    {
+                    let edit_event = match room.make_edit_event(&event_id, edited_content).await {
                         Ok(e) => e,
                         Err(err) => {
                             warn!("couldn't create edited event: {err}");
-                            return Ok(());
+                            return Ok(true);
                         }
                     };
 
@@ -895,6 +992,7 @@ impl QueueStorage {
                         room.redact(&event_id, None, Some(de.own_transaction_id.into())).await
                     {
                         warn!("error when sending a redact for {event_id}: {err}");
+                        return Ok(false);
                     }
                 } else {
                     // The parent event is still local (sending must have failed); redact the local
@@ -905,13 +1003,38 @@ impl QueueStorage {
                         .map_err(RoomSendQueueStorageError::StorageError)?;
 
                     if !removed {
-                        warn!("missing local echo upon dependent redact??");
+                        warn!("missing local echo upon dependent redact");
                     }
+                }
+            }
+
+            DependentQueuedEventKind::React { key } => {
+                if let Some(event_id) = de.event_id {
+                    // Queue the reaction event in the send queue 🧠.
+                    let react_event =
+                        ReactionEventContent::new(Annotation::new(event_id, key)).into();
+                    let serializable = SerializableEventContent::from_raw(
+                        Raw::new(&react_event)
+                            .map_err(RoomSendQueueStorageError::JsonSerialization)?,
+                        react_event.event_type().to_string(),
+                    );
+
+                    store
+                        .save_send_queue_event(
+                            &self.room_id,
+                            de.own_transaction_id.into(),
+                            serializable,
+                        )
+                        .await
+                        .map_err(RoomSendQueueStorageError::StorageError)?;
+                } else {
+                    // Not applied yet, we should retry later => false.
+                    return Ok(false);
                 }
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     #[instrument(skip(self))]
@@ -928,6 +1051,10 @@ impl QueueStorage {
             .map_err(RoomSendQueueStorageError::StorageError)?;
 
         let num_initial_dependent_events = dependent_events.len();
+        if num_initial_dependent_events == 0 {
+            // Returning early here avoids a bit of useless logging.
+            return Ok(());
+        }
 
         let canonicalized_dependent_events = canonicalize_dependent_events(&dependent_events);
 
@@ -955,14 +1082,16 @@ impl QueueStorage {
             let dependent_id = dependent.own_transaction_id.clone();
 
             match self.try_apply_single_dependent_event(&client, dependent).await {
-                Ok(()) => {
-                    // The dependent event has been successfully applied, forget about it.
-                    store
-                        .remove_dependent_send_queue_event(&self.room_id, &dependent_id)
-                        .await
-                        .map_err(RoomSendQueueStorageError::StorageError)?;
+                Ok(should_remove) => {
+                    if should_remove {
+                        // The dependent event has been successfully applied, forget about it.
+                        store
+                            .remove_dependent_send_queue_event(&self.room_id, &dependent_id)
+                            .await
+                            .map_err(RoomSendQueueStorageError::StorageError)?;
 
-                    num_dependent_events -= 1;
+                        num_dependent_events -= 1;
+                    }
                 }
 
                 Err(err) => {
@@ -978,6 +1107,47 @@ impl QueueStorage {
 
         Ok(())
     }
+
+    /// Remove a single dependent event from storage.
+    async fn remove_dependent_send_queue_event(
+        &self,
+        dependent_event_id: &ChildTransactionId,
+    ) -> Result<bool, RoomSendQueueStorageError> {
+        // Keep the lock until we're done touching the storage.
+        let _being_sent = self.being_sent.read().await;
+
+        Ok(self
+            .client()?
+            .store()
+            .remove_dependent_send_queue_event(&self.room_id, dependent_event_id)
+            .await?)
+    }
+}
+
+/// The content of a local echo.
+#[derive(Clone, Debug)]
+pub enum LocalEchoContent {
+    /// The local echo contains an actual event ready to display.
+    Event {
+        /// Content of the event itself (along with its type) that we are about
+        /// to send.
+        serialized_event: SerializableEventContent,
+        /// A handle to manipulate the sending of the associated event.
+        send_handle: SendHandle,
+        /// Whether trying to send this local echo failed in the past with an
+        /// unrecoverable error (see [`SendQueueRoomError::is_recoverable`]).
+        is_wedged: bool,
+    },
+
+    /// A local echo has been reacted to.
+    React {
+        /// The key with which the local echo has been reacted to.
+        key: String,
+        /// A handle to manipulate the sending of the reaction.
+        send_handle: SendReactionHandle,
+        /// The local echo which has been reacted to.
+        applies_to: OwnedTransactionId,
+    },
 }
 
 /// An event that has been locally queued for sending, but hasn't been sent yet.
@@ -985,14 +1155,8 @@ impl QueueStorage {
 pub struct LocalEcho {
     /// Transaction id used to identify this event.
     pub transaction_id: OwnedTransactionId,
-    /// Content of the event itself (along with its type) that we are about to
-    /// send.
-    pub serialized_event: SerializableEventContent,
-    /// A handle to manipulate the sending of the associated event.
-    pub send_handle: SendHandle,
-    /// Whether trying to send this local echo failed in the past with an
-    /// unrecoverable error (see [`SendQueueRoomError::is_recoverable`]).
-    pub is_wedged: bool,
+    /// The content for the local echo.
+    pub content: LocalEchoContent,
 }
 
 /// An update to a room send queue, observable with
@@ -1036,6 +1200,12 @@ pub enum RoomSendQueueUpdate {
         /// while an unrecoverable error will be parked, until the user
         /// decides to cancel sending it.
         is_recoverable: bool,
+    },
+
+    /// The event has been unwedged and sending is now being retried.
+    RetryEvent {
+        /// Transaction id used to identify this event.
+        transaction_id: OwnedTransactionId,
     },
 
     /// The event has been sent to the server, and the query returned
@@ -1159,6 +1329,91 @@ impl SendHandle {
         )
         .await
     }
+
+    /// Send a reaction to the event as soon as it's sent.
+    ///
+    /// If returning `Ok(None)`; this means the reaction couldn't be sent
+    /// because the event is already a remote one.
+    #[instrument(skip(self), fields(room_id = %self.room.inner.room.room_id(), txn_id = %self.transaction_id))]
+    pub async fn react(
+        &self,
+        key: String,
+    ) -> Result<Option<SendReactionHandle>, RoomSendQueueStorageError> {
+        trace!("received an intent to react");
+
+        if let Some(reaction_txn_id) =
+            self.room.inner.queue.react(&self.transaction_id, key.clone()).await?
+        {
+            trace!("successfully queued react");
+
+            // Wake up the queue, in case the room was asleep before the sending.
+            self.room.inner.notifier.notify_one();
+
+            // Propagate a new local event.
+            let send_handle = SendReactionHandle {
+                room: self.room.clone(),
+                transaction_id: reaction_txn_id.clone(),
+            };
+
+            let _ = self.room.inner.updates.send(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
+                // Note: we do want to use the txn_id we're going to use for the reaction, not the
+                // one for the event we're reacting to.
+                transaction_id: reaction_txn_id.into(),
+                content: LocalEchoContent::React {
+                    key,
+                    send_handle: send_handle.clone(),
+                    applies_to: self.transaction_id.clone(),
+                },
+            }));
+
+            Ok(Some(send_handle))
+        } else {
+            debug!("local echo doesn't exist anymore, can't react");
+            Ok(None)
+        }
+    }
+}
+
+/// A handle to execute actions on the sending of a reaction.
+#[derive(Clone, Debug)]
+pub struct SendReactionHandle {
+    /// Reference to the send queue for the room where this reaction was sent.
+    room: RoomSendQueue,
+    /// The own transaction id for the reaction.
+    transaction_id: ChildTransactionId,
+}
+
+impl SendReactionHandle {
+    /// Abort the sending of the reaction.
+    ///
+    /// Will return true if the reaction could be aborted, false if it's been
+    /// sent (and there's no matching local echo anymore).
+    pub async fn abort(&self) -> Result<bool, RoomSendQueueStorageError> {
+        if self.room.inner.queue.remove_dependent_send_queue_event(&self.transaction_id).await? {
+            // Simple case: the reaction was found in the dependent event list.
+
+            // Propagate a cancelled update too.
+            let _ = self.room.inner.updates.send(RoomSendQueueUpdate::CancelledLocalEvent {
+                transaction_id: self.transaction_id.clone().into(),
+            });
+
+            return Ok(true);
+        }
+
+        // The reaction has already been queued for sending, try to abort it using a
+        // regular abort.
+        let handle = SendHandle {
+            room: self.room.clone(),
+            transaction_id: self.transaction_id.clone().into(),
+        };
+
+        handle.abort().await
+    }
+
+    /// The transaction id that will be used to send this reaction later.
+    pub fn transaction_id(&self) -> &TransactionId {
+        &self.transaction_id
+    }
 }
 
 /// From a given source of [`DependentQueuedEvent`], return only the most
@@ -1185,8 +1440,12 @@ fn canonicalize_dependent_events(dependent: &[DependentQueuedEvent]) -> Vec<Depe
                 {
                     *prev_edit = d;
                 } else {
-                    prevs.push(d);
+                    prevs.insert(0, d);
                 }
+            }
+
+            DependentQueuedEventKind::React { .. } => {
+                prevs.push(d);
             }
 
             DependentQueuedEventKind::Redact => {
@@ -1412,5 +1671,38 @@ mod tests {
                 assert_matches!(dependent.kind, DependentQueuedEventKind::Edit { .. });
             }
         }
+    }
+
+    #[test]
+    fn test_canonicalize_reactions_after_edits() {
+        // Sending reactions should happen after edits to a given event.
+        let txn = TransactionId::new();
+
+        let react_id = ChildTransactionId::new();
+        let react = DependentQueuedEvent {
+            own_transaction_id: react_id.clone(),
+            kind: DependentQueuedEventKind::React { key: "🧠".to_owned() },
+            parent_transaction_id: txn.clone(),
+            event_id: None,
+        };
+
+        let edit_id = ChildTransactionId::new();
+        let edit = DependentQueuedEvent {
+            own_transaction_id: edit_id.clone(),
+            kind: DependentQueuedEventKind::Edit {
+                new_content: SerializableEventContent::new(
+                    &RoomMessageEventContent::text_plain("edit").into(),
+                )
+                .unwrap(),
+            },
+            parent_transaction_id: txn,
+            event_id: None,
+        };
+
+        let res = canonicalize_dependent_events(&[react, edit]);
+
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].own_transaction_id, edit_id);
+        assert_eq!(res[1].own_transaction_id, react_id);
     }
 }

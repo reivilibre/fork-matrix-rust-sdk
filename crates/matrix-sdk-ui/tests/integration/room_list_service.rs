@@ -20,6 +20,7 @@ use matrix_sdk_ui::{
     RoomListService,
 };
 use ruma::{
+    api::client::room::create_room::v3::Request as CreateRoomRequest,
     assign, event_id,
     events::{room::message::RoomMessageEventContent, StateEventType},
     mxc_uri, room_id, uint,
@@ -27,7 +28,10 @@ use ruma::{
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
 use tokio::{spawn, sync::mpsc::channel, task::yield_now};
-use wiremock::MockServer;
+use wiremock::{
+    matchers::{header, method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 use crate::timeline::sliding_sync::{assert_timeline_stream, timeline_event};
 
@@ -327,6 +331,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.name", ""],
+                        ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
                     ],
                     "include_heroes": true,
@@ -2211,6 +2216,46 @@ async fn test_room_subscription() -> Result<(), Error> {
         },
     };
 
+    // Subscribe to an already subscribed room. Nothing happens.
+
+    room_list.subscribe_to_rooms(
+        &[room_id_1],
+        Some(assign!(RoomSubscription::default(), {
+            required_state: vec![
+                (StateEventType::RoomName, "".to_owned()),
+                (StateEventType::RoomTopic, "".to_owned()),
+                (StateEventType::RoomAvatar, "".to_owned()),
+                (StateEventType::RoomCanonicalAlias, "".to_owned()),
+            ],
+            timeline_limit: Some(uint!(30)),
+        })),
+    );
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        // strict comparison (with `=`) because we want to ensure
+        // the absence of `room_subscriptions`.
+        assert request = {
+            "conn_id": "room-list",
+            "lists": {
+                ALL_ROOMS: {
+                    "ranges": [[0, 2]],
+                },
+            },
+            // NO `room_subscriptions`!
+            "extensions": {
+                "account_data": { "enabled": true },
+                "receipts": { "enabled": true, "rooms": [ "*" ] },
+                "typing": { "enabled": true },
+            },
+        },
+        respond with = {
+            "pos": "3",
+            "lists": {},
+            "rooms": {},
+        },
+    };
+
     Ok(())
 }
 
@@ -2361,6 +2406,33 @@ async fn test_room_timeline() -> Result<(), Error> {
     };
 
     Ok(())
+}
+
+#[async_test]
+async fn test_room_empty_timeline() {
+    let (client, server, room_list) = new_room_list_service().await.unwrap();
+    mock_encryption_state(&server, false).await;
+
+    Mock::given(method("POST"))
+        .and(path("_matrix/client/r0/createRoom"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "room_id": "!example:localhost"})),
+        )
+        .mount(&server)
+        .await;
+
+    let room = client.create_room(CreateRoomRequest::default()).await.unwrap();
+    let room_id = room.room_id().to_owned();
+
+    // The room wasn't synced, but it will be available
+    let room = room_list.room(&room_id).unwrap();
+    let timeline = room.default_room_timeline_builder().await.unwrap().build().await.unwrap();
+    let (prev_items, _) = timeline.subscribe().await;
+
+    // However, since the room wasn't synced its timeline won't have any initial
+    // items
+    assert!(prev_items.is_empty());
 }
 
 #[async_test]

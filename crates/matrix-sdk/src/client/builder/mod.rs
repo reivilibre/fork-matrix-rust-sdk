@@ -16,21 +16,19 @@
 #[cfg(feature = "load-testing")]
 use goose::prelude::GooseUser;
 use std::fmt::Debug;
+mod homeserver_config;
+
 use std::{fmt, sync::Arc};
 
+use homeserver_config::*;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
 use ruma::{
-    api::{
-        client::discovery::{discover_homeserver, get_supported_versions},
-        error::FromHttpResponseError,
-        MatrixVersion,
-    },
+    api::{error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex, OnceCell};
 use tracing::{debug, field::debug, instrument, Span};
-use url::Url;
 
 use super::{Client, ClientInner};
 #[cfg(feature = "e2e-encryption")]
@@ -132,24 +130,12 @@ impl ClientBuilder {
 
     /// Set the homeserver URL to use.
     ///
-    /// The following methods are mutually exclusive:
-    /// [`homeserver_url()`][Self::homeserver_url]
-    /// [`server_name()`][Self::server_name]
-    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
-    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// The following methods are mutually exclusive: [`Self::homeserver_url`],
+    /// [`Self::server_name`] [`Self::insecure_server_name_no_tls`],
+    /// [`Self::server_name_or_homeserver_url`].
     /// If you set more than one, then whatever was set last will be used.
     pub fn homeserver_url(mut self, url: impl AsRef<str>) -> Self {
-        self.homeserver_cfg = Some(HomeserverConfig::Url(url.as_ref().to_owned()));
-        self
-    }
-
-    /// Set sliding sync to a specific version.
-    #[cfg(feature = "experimental-sliding-sync")]
-    pub fn sliding_sync_version_builder(
-        mut self,
-        version_builder: SlidingSyncVersionBuilder,
-    ) -> Self {
-        self.sliding_sync_version_builder = version_builder;
+        self.homeserver_cfg = Some(HomeserverConfig::HomeserverUrl(url.as_ref().to_owned()));
         self
     }
 
@@ -158,11 +144,9 @@ impl ClientBuilder {
     /// We assume we can connect in HTTPS to that server. If that's not the
     /// case, prefer using [`Self::insecure_server_name_no_tls`].
     ///
-    /// The following methods are mutually exclusive:
-    /// [`homeserver_url()`][Self::homeserver_url]
-    /// [`server_name()`][Self::server_name]
-    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
-    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// The following methods are mutually exclusive: [`Self::homeserver_url`],
+    /// [`Self::server_name`] [`Self::insecure_server_name_no_tls`],
+    /// [`Self::server_name_or_homeserver_url`].
     /// If you set more than one, then whatever was set last will be used.
     pub fn server_name(mut self, server_name: &ServerName) -> Self {
         self.homeserver_cfg = Some(HomeserverConfig::ServerName {
@@ -177,11 +161,9 @@ impl ClientBuilder {
     /// (not secured) scheme. This also relaxes OIDC discovery checks to allow
     /// HTTP schemes.
     ///
-    /// The following methods are mutually exclusive:
-    /// [`homeserver_url()`][Self::homeserver_url]
-    /// [`server_name()`][Self::server_name]
-    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
-    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// The following methods are mutually exclusive: [`Self::homeserver_url`],
+    /// [`Self::server_name`] [`Self::insecure_server_name_no_tls`],
+    /// [`Self::server_name_or_homeserver_url`].
     /// If you set more than one, then whatever was set last will be used.
     pub fn insecure_server_name_no_tls(mut self, server_name: &ServerName) -> Self {
         self.homeserver_cfg = Some(HomeserverConfig::ServerName {
@@ -194,18 +176,27 @@ impl ClientBuilder {
     /// Set the server name to discover the homeserver from, falling back to
     /// using it as a homeserver URL if discovery fails. When falling back to a
     /// homeserver URL, a check is made to ensure that the server exists (unlike
-    /// [`homeserver_url()`][Self::homeserver_url]), so you can guarantee that
-    /// the client is ready to use.
+    /// [`Self::homeserver_url`], so you can guarantee that the client is ready
+    /// to use.
     ///
-    /// The following methods are mutually exclusive:
-    /// [`homeserver_url()`][Self::homeserver_url]
-    /// [`server_name()`][Self::server_name]
-    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
-    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// The following methods are mutually exclusive: [`Self::homeserver_url`],
+    /// [`Self::server_name`] [`Self::insecure_server_name_no_tls`],
+    /// [`Self::server_name_or_homeserver_url`].
     /// If you set more than one, then whatever was set last will be used.
     pub fn server_name_or_homeserver_url(mut self, server_name_or_url: impl AsRef<str>) -> Self {
-        self.homeserver_cfg =
-            Some(HomeserverConfig::ServerNameOrUrl(server_name_or_url.as_ref().to_owned()));
+        self.homeserver_cfg = Some(HomeserverConfig::ServerNameOrHomeserverUrl(
+            server_name_or_url.as_ref().to_owned(),
+        ));
+        self
+    }
+
+    /// Set sliding sync to a specific version.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn sliding_sync_version_builder(
+        mut self,
+        version_builder: SlidingSyncVersionBuilder,
+    ) -> Self {
+        self.sliding_sync_version_builder = version_builder;
         self
     }
 
@@ -466,7 +457,9 @@ impl ClientBuilder {
             let mut client =
                 BaseClient::with_store_config(build_store_config(self.store_config).await?);
             #[cfg(feature = "e2e-encryption")]
-            (client.room_key_recipient_strategy = self.room_key_recipient_strategy.clone());
+            {
+                client.room_key_recipient_strategy = self.room_key_recipient_strategy;
+            }
             client
         };
 
@@ -479,20 +472,8 @@ impl ClientBuilder {
         );
 
         #[allow(unused_variables)]
-        let (homeserver, well_known, supported_versions) = match homeserver_cfg {
-            HomeserverConfig::Url(url) => (Url::parse(&url)?, None, None),
-
-            HomeserverConfig::ServerName { server: server_name, protocol } => {
-                let well_known = discover_homeserver(server_name, protocol, &http_client).await?;
-
-                (Url::parse(&well_known.homeserver.base_url)?, Some(well_known), None)
-            }
-
-            HomeserverConfig::ServerNameOrUrl(server_name_or_url) => {
-                discover_homeserver_from_server_name_or_url(server_name_or_url, &http_client)
-                    .await?
-            }
-        };
+        let HomeserverDiscoveryResult { server, homeserver, well_known, supported_versions } =
+            homeserver_cfg.discover(&http_client).await?;
 
         #[cfg(feature = "experimental-sliding-sync")]
         let sliding_sync_version = {
@@ -538,6 +519,7 @@ impl ClientBuilder {
         let event_cache = OnceCell::new();
         let inner = ClientInner::new(
             auth_ctx,
+            server,
             homeserver,
             #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_version,
@@ -558,62 +540,6 @@ impl ClientBuilder {
     }
 }
 
-/// Discovers a homeserver from a server name or a URL.
-///
-/// Tries well-known discovery and checking if the URL points to a homeserver.
-async fn discover_homeserver_from_server_name_or_url(
-    mut server_name_or_url: String,
-    http_client: &HttpClient,
-) -> Result<
-    (Url, Option<discover_homeserver::Response>, Option<get_supported_versions::Response>),
-    ClientBuildError,
-> {
-    let mut discovery_error: Option<ClientBuildError> = None;
-
-    // Attempt discovery as a server name first.
-    let sanitize_result = sanitize_server_name(&server_name_or_url);
-
-    if let Ok(server_name) = sanitize_result.as_ref() {
-        let protocol = if server_name_or_url.starts_with("http://") {
-            UrlScheme::Http
-        } else {
-            UrlScheme::Https
-        };
-
-        match discover_homeserver(server_name.clone(), protocol, http_client).await {
-            Ok(well_known) => {
-                return Ok((Url::parse(&well_known.homeserver.base_url)?, Some(well_known), None));
-            }
-            Err(e) => {
-                debug!(error = %e, "Well-known discovery failed.");
-                discovery_error = Some(e);
-
-                // Check if the server name points to a homeserver.
-                server_name_or_url = match protocol {
-                    UrlScheme::Http => format!("http://{server_name}"),
-                    UrlScheme::Https => format!("https://{server_name}"),
-                }
-            }
-        }
-    }
-
-    // When discovery fails, or the input isn't a valid server name, fallback to
-    // trying a homeserver URL.
-    if let Ok(homeserver_url) = Url::parse(&server_name_or_url) {
-        // Make sure the URL is definitely for a homeserver.
-        match get_supported_versions(&homeserver_url, http_client).await {
-            Ok(response) => {
-                return Ok((homeserver_url, None, Some(response)));
-            }
-            Err(e) => {
-                debug!(error = %e, "Checking supported versions failed.");
-            }
-        }
-    }
-
-    Err(discovery_error.unwrap_or(ClientBuildError::InvalidServerName))
-}
-
 /// Creates a server name from a user supplied string. The string is first
 /// sanitized by removing whitespace, the http(s) scheme and any trailing
 /// slashes before being parsed.
@@ -621,56 +547,6 @@ pub fn sanitize_server_name(s: &str) -> crate::Result<OwnedServerName, IdParseEr
     ServerName::parse(
         s.trim().trim_start_matches("http://").trim_start_matches("https://").trim_end_matches('/'),
     )
-}
-
-/// Discovers a homeserver by looking up the well-known at the supplied server
-/// name.
-async fn discover_homeserver(
-    server_name: OwnedServerName,
-    protocol: UrlScheme,
-    http_client: &HttpClient,
-) -> Result<discover_homeserver::Response, ClientBuildError> {
-    debug!("Trying to discover the homeserver");
-
-    let homeserver = match protocol {
-        UrlScheme::Http => format!("http://{server_name}"),
-        UrlScheme::Https => format!("https://{server_name}"),
-    };
-
-    let well_known = http_client
-        .send(
-            discover_homeserver::Request::new(),
-            Some(RequestConfig::short_retry()),
-            homeserver,
-            None,
-            &[MatrixVersion::V1_0],
-            Default::default(),
-        )
-        .await
-        .map_err(|e| match e {
-            HttpError::Api(err) => ClientBuildError::AutoDiscovery(err),
-            err => ClientBuildError::Http(err),
-        })?;
-
-    debug!(homeserver_url = well_known.homeserver.base_url, "Discovered the homeserver");
-
-    Ok(well_known)
-}
-
-async fn get_supported_versions(
-    homeserver_url: &Url,
-    http_client: &HttpClient,
-) -> Result<get_supported_versions::Response, HttpError> {
-    http_client
-        .send(
-            get_supported_versions::Request::new(),
-            Some(RequestConfig::short_retry()),
-            homeserver_url.to_string(),
-            None,
-            &[MatrixVersion::V1_0],
-            Default::default(),
-        )
-        .await
 }
 
 #[allow(clippy::unused_async)] // False positive when building with !sqlite & !indexeddb
@@ -745,23 +621,6 @@ async fn build_indexeddb_store_config(
     _passphrase: Option<&str>,
 ) -> Result<StoreConfig, ClientBuildError> {
     panic!("the IndexedDB is only available on the 'wasm32' arch")
-}
-
-#[derive(Clone, Copy, Debug)]
-enum UrlScheme {
-    Http,
-    Https,
-}
-
-#[derive(Clone, Debug)]
-enum HomeserverConfig {
-    /// A precise URL, including the protocol.
-    Url(String),
-    /// A host/port pair representing a server URL.
-    ServerName { server: OwnedServerName, protocol: UrlScheme },
-    /// First attempts to build as a server name, then falls back to a URL,
-    /// failing if no valid homeserver is found.
-    ServerNameOrUrl(String),
 }
 
 #[derive(Clone, Debug)]
@@ -889,6 +748,7 @@ pub(crate) mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_test::{async_test, test_json};
     use serde_json::{json_internal, Value as JsonValue};
+    use url::Url;
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,

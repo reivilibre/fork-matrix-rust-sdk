@@ -25,12 +25,15 @@ mod utility;
 
 pub use account::{Account, OlmMessageHash, PickledAccount, StaticAccountData};
 pub(crate) use account::{OlmDecryptionInfo, SessionType};
+pub(crate) use group_sessions::{
+    sender_data_finder::{self, SenderDataFinder},
+    ShareState,
+};
 pub use group_sessions::{
     BackedUpRoomKey, EncryptionSettings, ExportedRoomKey, InboundGroupSession, KnownSenderData,
     OutboundGroupSession, PickledInboundGroupSession, PickledOutboundGroupSession, SenderData,
-    SessionCreationError, SessionExportError, SessionKey, ShareInfo,
+    SenderDataType, SessionCreationError, SessionExportError, SessionKey, ShareInfo,
 };
-pub(crate) use group_sessions::{SenderDataFinder, ShareState};
 pub use session::{PickledSession, Session};
 pub use signing::{CrossSigningStatus, PickledCrossSigningIdentity, PrivateCrossSigningIdentity};
 pub(crate) use utility::{SignedJsonObject, VerifyJson};
@@ -205,7 +208,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn edit_decryption() {
+    async fn test_edit_decryption() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
         let event_id = event_id!("$1234adfad:asdf");
@@ -265,7 +268,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn relates_to_decryption() {
+    async fn test_relates_to_decryption() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
         let event_id = event_id!("$1234adfad:asdf");
@@ -337,7 +340,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn group_session_export() {
+    async fn test_group_session_export() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
 

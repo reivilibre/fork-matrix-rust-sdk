@@ -16,8 +16,9 @@ use core::fmt;
 use std::{borrow::Borrow, cmp::min, iter, ops::Deref};
 
 use async_trait::async_trait;
-use deadpool_sqlite::Object as SqliteConn;
+use deadpool_sqlite::Object as SqliteAsyncConn;
 use itertools::Itertools;
+use matrix_sdk_store_encryption::StoreCipher;
 use rusqlite::{limits::Limit, OptionalExtension, Params, Row, Statement, Transaction};
 
 use crate::{
@@ -55,7 +56,7 @@ impl rusqlite::ToSql for Key {
 }
 
 #[async_trait]
-pub(crate) trait SqliteObjectExt {
+pub(crate) trait SqliteAsyncConnExt {
     async fn execute<P>(
         &self,
         sql: impl AsRef<str> + Send + 'static,
@@ -104,7 +105,7 @@ pub(crate) trait SqliteObjectExt {
 }
 
 #[async_trait]
-impl SqliteObjectExt for SqliteConn {
+impl SqliteAsyncConnExt for SqliteAsyncConn {
     async fn execute<P>(
         &self,
         sql: impl AsRef<str> + Send + 'static,
@@ -185,20 +186,6 @@ impl SqliteObjectExt for SqliteConn {
     }
 }
 
-pub(crate) trait SqliteConnectionExt {
-    fn set_kv(&self, key: &str, value: &[u8]) -> rusqlite::Result<()>;
-}
-
-impl SqliteConnectionExt for rusqlite::Connection {
-    fn set_kv(&self, key: &str, value: &[u8]) -> rusqlite::Result<()> {
-        self.execute(
-            "INSERT INTO kv VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
-            (key, value),
-        )?;
-        Ok(())
-    }
-}
-
 pub(crate) trait SqliteTransactionExt {
     fn chunk_large_query_over<Query, Res>(
         &self,
@@ -255,8 +242,61 @@ impl<'a> SqliteTransactionExt for Transaction<'a> {
     }
 }
 
+/// Extension trait for a [`rusqlite::Connection`] that contains a key-value
+/// table named `kv`.
+///
+/// The table should be created like this:
+///
+/// ```sql
+/// CREATE TABLE "kv" (
+///     "key" TEXT PRIMARY KEY NOT NULL,
+///     "value" BLOB NOT NULL
+/// );
+/// ```
+pub(crate) trait SqliteKeyValueStoreConnExt {
+    /// Store the given value for the given key.
+    fn set_kv(&self, key: &str, value: &[u8]) -> rusqlite::Result<()>;
+
+    /// Set the version of the database.
+    fn set_db_version(&self, version: u8) -> rusqlite::Result<()> {
+        self.set_kv("version", &[version])
+    }
+}
+
+impl SqliteKeyValueStoreConnExt for rusqlite::Connection {
+    fn set_kv(&self, key: &str, value: &[u8]) -> rusqlite::Result<()> {
+        self.execute(
+            "INSERT INTO kv VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
+            (key, value),
+        )?;
+        Ok(())
+    }
+}
+
+/// Extension trait for an [`SqliteAsyncConn`] that contains a key-value
+/// table named `kv`.
+///
+/// The table should be created like this:
+///
+/// ```sql
+/// CREATE TABLE "kv" (
+///     "key" TEXT PRIMARY KEY NOT NULL,
+///     "value" BLOB NOT NULL
+/// );
+/// ```
 #[async_trait]
-pub(crate) trait SqliteObjectStoreExt: SqliteObjectExt {
+pub(crate) trait SqliteKeyValueStoreAsyncConnExt: SqliteAsyncConnExt {
+    /// Whether the `kv` table exists in this database.
+    async fn kv_table_exists(&self) -> rusqlite::Result<bool> {
+        self.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv')",
+            (),
+            |row| row.get(0),
+        )
+        .await
+    }
+
+    /// Get the stored value for the given key.
     async fn get_kv(&self, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
         let key = key.to_owned();
         self.query_row("SELECT value FROM kv WHERE key = ?", (key,), |row| row.get(0))
@@ -264,39 +304,54 @@ pub(crate) trait SqliteObjectStoreExt: SqliteObjectExt {
             .optional()
     }
 
+    /// Store the given value for the given key.
     async fn set_kv(&self, key: &str, value: Vec<u8>) -> rusqlite::Result<()>;
+
+    /// Get the version of the database.
+    async fn db_version(&self) -> Result<u8, OpenStoreError> {
+        let kv_exists = self.kv_table_exists().await.map_err(OpenStoreError::LoadVersion)?;
+
+        if kv_exists {
+            match self.get_kv("version").await.map_err(OpenStoreError::LoadVersion)?.as_deref() {
+                Some([v]) => Ok(*v),
+                Some(_) => Err(OpenStoreError::InvalidVersion),
+                None => Err(OpenStoreError::MissingVersion),
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get the [`StoreCipher`] of the database or create it.
+    async fn get_or_create_store_cipher(
+        &self,
+        passphrase: &str,
+    ) -> Result<StoreCipher, OpenStoreError> {
+        let encrypted_cipher = self.get_kv("cipher").await.map_err(OpenStoreError::LoadCipher)?;
+
+        let cipher = if let Some(encrypted) = encrypted_cipher {
+            StoreCipher::import(passphrase, &encrypted)?
+        } else {
+            let cipher = StoreCipher::new()?;
+            #[cfg(not(test))]
+            let export = cipher.export(passphrase);
+            #[cfg(test)]
+            let export = cipher._insecure_export_fast_for_testing(passphrase);
+            self.set_kv("cipher", export?).await.map_err(OpenStoreError::SaveCipher)?;
+            cipher
+        };
+
+        Ok(cipher)
+    }
 }
 
 #[async_trait]
-impl SqliteObjectStoreExt for SqliteConn {
+impl SqliteKeyValueStoreAsyncConnExt for SqliteAsyncConn {
     async fn set_kv(&self, key: &str, value: Vec<u8>) -> rusqlite::Result<()> {
         let key = key.to_owned();
         self.interact(move |conn| conn.set_kv(&key, &value)).await.unwrap()?;
 
         Ok(())
-    }
-}
-
-/// Load the version of the database with the given connection.
-pub(crate) async fn load_db_version(conn: &SqliteConn) -> Result<u8, OpenStoreError> {
-    let kv_exists = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'kv'",
-            (),
-            |row| row.get::<_, u32>(0),
-        )
-        .await
-        .map_err(OpenStoreError::LoadVersion)?
-        > 0;
-
-    if kv_exists {
-        match conn.get_kv("version").await.map_err(OpenStoreError::LoadVersion)?.as_deref() {
-            Some([v]) => Ok(*v),
-            Some(_) => Err(OpenStoreError::InvalidVersion),
-            None => Err(OpenStoreError::MissingVersion),
-        }
-    } else {
-        Ok(0)
     }
 }
 

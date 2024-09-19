@@ -12,31 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::VecDeque, future::Future, sync::Arc};
+use std::{collections::VecDeque, future::Future, num::NonZeroUsize, sync::Arc};
 
 use eyeball_im::{ObservableVector, ObservableVectorTransaction, ObservableVectorTransactionEntry};
-use matrix_sdk::{deserialized_responses::SyncTimelineEvent, send_queue::SendHandle};
+use itertools::Itertools as _;
+use matrix_sdk::{
+    deserialized_responses::SyncTimelineEvent, ring_buffer::RingBuffer, send_queue::SendHandle,
+};
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
-    events::AnySyncEphemeralRoomEvent, push::Action, serde::Raw, EventId,
-    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId,
-    UserId,
+    events::{
+        poll::unstable_start::NewUnstablePollStartEventContentWithoutRelation,
+        relation::Replacement, room::message::RoomMessageEventContentWithoutRelation,
+        AnySyncEphemeralRoomEvent,
+    },
+    push::Action,
+    serde::Raw,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
+    RoomVersionId, UserId,
 };
 use tracing::{debug, instrument, trace, warn};
 
-use super::{HandleManyEventsResult, TimelineInnerSettings};
+use super::{HandleManyEventsResult, TimelineFocusKind, TimelineSettings};
 use crate::{
     events::SyncTimelineEventWithoutContent,
     timeline::{
         day_dividers::DayDividerAdjuster,
         event_handler::{
-            Flow, HandleEventResult, LiveTimelineUpdatesAllowed, TimelineEventContext,
-            TimelineEventHandler, TimelineEventKind, TimelineItemPosition,
+            Flow, HandleEventResult, TimelineEventContext, TimelineEventHandler, TimelineEventKind,
+            TimelineItemPosition,
         },
         event_item::RemoteEventOrigin,
-        polls::PollPendingEvents,
+        polls::PendingPollEvents,
         reactions::Reactions,
         read_receipts::ReadReceipts,
         traits::RoomDataProvider,
@@ -54,23 +63,24 @@ use crate::{
 pub(crate) enum TimelineEnd {
     /// Event should be prepended to the front of the timeline.
     Front,
-    /// Event should appended to the back of the timeline.
+    /// Event should be appended to the back of the timeline.
     Back,
 }
 
 #[derive(Debug)]
-pub(in crate::timeline) struct TimelineInnerState {
+pub(in crate::timeline) struct TimelineState {
     pub items: ObservableVector<Arc<TimelineItem>>,
-    pub meta: TimelineInnerMetadata,
+    pub meta: TimelineMetadata,
 
-    /// Which timeline live updates are allowed.
-    pub live_timeline_updates_type: LiveTimelineUpdatesAllowed,
+    /// The kind of focus of this timeline.
+    timeline_focus: TimelineFocusKind,
 }
 
-impl TimelineInnerState {
+impl TimelineState {
     pub(super) fn new(
+        timeline_focus: TimelineFocusKind,
+        own_user_id: OwnedUserId,
         room_version: RoomVersionId,
-        live_timeline_updates_type: LiveTimelineUpdatesAllowed,
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: bool,
@@ -80,17 +90,18 @@ impl TimelineInnerState {
             // sliding-sync tests with 20 events lag. This should still be
             // small enough.
             items: ObservableVector::with_capacity(32),
-            meta: TimelineInnerMetadata::new(
+            meta: TimelineMetadata::new(
+                own_user_id,
                 room_version,
                 internal_id_prefix,
                 unable_to_decrypt_hook,
                 is_room_encrypted,
             ),
-            live_timeline_updates_type,
+            timeline_focus,
         }
     }
 
-    /// Add the given remove events at the given end of the timeline.
+    /// Add the given remote events at the given end of the timeline.
     ///
     /// Note: when the `position` is [`TimelineEnd::Front`], prepended events
     /// should be ordered in *reverse* topological order, that is, `events[0]`
@@ -102,7 +113,7 @@ impl TimelineInnerState {
         position: TimelineEnd,
         origin: RemoteEventOrigin,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) -> HandleManyEventsResult {
         if events.is_empty() {
             return Default::default();
@@ -156,14 +167,14 @@ impl TimelineInnerState {
 
     /// Adds a local echo (for an event) to the timeline.
     #[instrument(skip_all)]
-    pub(super) async fn handle_local_event<P: RoomDataProvider>(
+    pub(super) async fn handle_local_event(
         &mut self,
         own_user_id: OwnedUserId,
         own_profile: Option<Profile>,
+        should_add_new_items: bool,
         txn_id: OwnedTransactionId,
         send_handle: Option<SendHandle>,
         content: TimelineEventKind,
-        room_data_provider: &P,
     ) {
         let ctx = TimelineEventContext {
             sender: own_user_id,
@@ -174,6 +185,7 @@ impl TimelineInnerState {
             // An event sent by ourselves is never matched against push rules.
             is_highlighted: false,
             flow: Flow::Local { txn_id, send_handle },
+            should_add_new_items,
         };
 
         let mut txn = self.transaction();
@@ -187,7 +199,6 @@ impl TimelineInnerState {
                 // Local events are never UTD, so no need to pass in a raw_event - this is only
                 // used to determine the type of UTD if there is one.
                 None,
-                room_data_provider,
             )
             .await;
 
@@ -196,14 +207,13 @@ impl TimelineInnerState {
         txn.commit();
     }
 
-    #[cfg(feature = "e2e-encryption")]
     pub(super) async fn retry_event_decryption<P: RoomDataProvider, Fut>(
         &mut self,
         retry_one: impl Fn(Arc<TimelineItem>) -> Fut,
         retry_indices: Vec<usize>,
         push_rules_context: Option<(ruma::push::Ruleset, ruma::push::PushConditionRoomCtx)>,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) where
         Fut: Future<Output = Option<TimelineEvent>>,
     {
@@ -264,19 +274,40 @@ impl TimelineInnerState {
         txn.commit();
     }
 
-    pub(super) fn transaction(&mut self) -> TimelineInnerStateTransaction<'_> {
+    /// Replaces the existing events in the timeline with the given remote ones.
+    ///
+    /// Note: when the `position` is [`TimelineEnd::Front`], prepended events
+    /// should be ordered in *reverse* topological order, that is, `events[0]`
+    /// is the most recent.
+    pub(super) async fn replace_with_remote_events<P: RoomDataProvider>(
+        &mut self,
+        events: Vec<SyncTimelineEvent>,
+        position: TimelineEnd,
+        origin: RemoteEventOrigin,
+        room_data_provider: &P,
+        settings: &TimelineSettings,
+    ) -> HandleManyEventsResult {
+        let mut txn = self.transaction();
+        txn.clear();
+        let result =
+            txn.add_remote_events_at(events, position, origin, room_data_provider, settings).await;
+        txn.commit();
+        result
+    }
+
+    pub(super) fn transaction(&mut self) -> TimelineStateTransaction<'_> {
         let items = self.items.transaction();
         let meta = self.meta.clone();
-        TimelineInnerStateTransaction {
+        TimelineStateTransaction {
             items,
             previous_meta: &mut self.meta,
             meta,
-            live_timeline_updates_type: self.live_timeline_updates_type.clone(),
+            timeline_focus: self.timeline_focus,
         }
     }
 }
 
-pub(in crate::timeline) struct TimelineInnerStateTransaction<'a> {
+pub(in crate::timeline) struct TimelineStateTransaction<'a> {
     /// A vector transaction over the items themselves. Holds temporary state
     /// until committed.
     pub items: ObservableVectorTransaction<'a, Arc<TimelineItem>>,
@@ -284,16 +315,16 @@ pub(in crate::timeline) struct TimelineInnerStateTransaction<'a> {
     /// A clone of the previous meta, that we're operating on during the
     /// transaction, and that will be committed to the previous meta location in
     /// [`Self::commit`].
-    pub meta: TimelineInnerMetadata,
-
-    /// Which timeline live updates are allowed.
-    pub live_timeline_updates_type: LiveTimelineUpdatesAllowed,
+    pub meta: TimelineMetadata,
 
     /// Pointer to the previous meta, only used during [`Self::commit`].
-    previous_meta: &'a mut TimelineInnerMetadata,
+    previous_meta: &'a mut TimelineMetadata,
+
+    /// The kind of focus of this timeline.
+    timeline_focus: TimelineFocusKind,
 }
 
-impl TimelineInnerStateTransaction<'_> {
+impl TimelineStateTransaction<'_> {
     /// Add the given remote events at the given end of the timeline.
     ///
     /// Note: when the `position` is [`TimelineEnd::Front`], prepended events
@@ -306,7 +337,7 @@ impl TimelineInnerStateTransaction<'_> {
         position: TimelineEnd,
         origin: RemoteEventOrigin,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) -> HandleManyEventsResult {
         let mut total = HandleManyEventsResult::default();
 
@@ -342,7 +373,29 @@ impl TimelineInnerStateTransaction<'_> {
 
         self.adjust_day_dividers(day_divider_adjuster);
 
+        self.check_no_unused_unique_ids();
         total
+    }
+
+    fn check_no_unused_unique_ids(&self) {
+        let duplicates = self
+            .items
+            .iter()
+            .duplicates_by(|item| item.unique_id())
+            .map(|item| item.unique_id())
+            .collect::<Vec<_>>();
+
+        if !duplicates.is_empty() {
+            #[cfg(any(debug_assertions, test))]
+            panic!("duplicate unique ids in this timeline:{:?}\n{:?}", duplicates, self.items);
+
+            #[cfg(not(any(debug_assertions, test)))]
+            tracing::error!(
+                "duplicate unique ids in this timeline:{:?}\n{:?}",
+                duplicates,
+                self.items
+            );
+        }
     }
 
     /// Handle a remote event.
@@ -353,17 +406,63 @@ impl TimelineInnerStateTransaction<'_> {
         event: SyncTimelineEvent,
         position: TimelineItemPosition,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
         day_divider_adjuster: &mut DayDividerAdjuster,
     ) -> HandleEventResult {
         let raw = event.event;
         let (event_id, sender, timestamp, txn_id, event_kind, should_add) = match raw.deserialize()
         {
             Ok(event) => {
+                let event_id = event.event_id().to_owned();
                 let room_version = room_data_provider.room_version();
-                let should_add = (settings.event_filter)(&event, &room_version);
+
+                let mut should_add = (settings.event_filter)(&event, &room_version);
+
+                if should_add {
+                    // Retrieve the origin of the event.
+                    let origin = match position {
+                        TimelineItemPosition::End { origin }
+                        | TimelineItemPosition::Start { origin } => origin,
+
+                        TimelineItemPosition::Update(idx) => self
+                            .items
+                            .get(idx)
+                            .and_then(|item| item.as_event())
+                            .and_then(|item| item.as_remote())
+                            .map_or(RemoteEventOrigin::Unknown, |item| item.origin),
+                    };
+
+                    match origin {
+                        RemoteEventOrigin::Sync | RemoteEventOrigin::Unknown => {
+                            should_add = match self.timeline_focus {
+                                TimelineFocusKind::PinnedEvents => {
+                                    // Only insert timeline items for pinned events, if the event
+                                    // came from the sync.
+                                    room_data_provider.is_pinned_event(&event_id)
+                                }
+
+                                TimelineFocusKind::Live => {
+                                    // Always add new items to a live timeline receiving items from
+                                    // sync.
+                                    true
+                                }
+
+                                TimelineFocusKind::Event => {
+                                    // Never add any item to a focused timeline when the item comes
+                                    // down from the sync.
+                                    false
+                                }
+                            };
+                        }
+
+                        RemoteEventOrigin::Pagination | RemoteEventOrigin::Cache => {
+                            // Forward the previous decision to add it.
+                        }
+                    }
+                }
+
                 (
-                    event.event_id().to_owned(),
+                    event_id,
                     event.sender().to_owned(),
                     event.origin_server_ts(),
                     event.transaction_id().map(ToOwned::to_owned),
@@ -473,22 +572,24 @@ impl TimelineInnerStateTransaction<'_> {
                 encryption_info: event.encryption_info,
                 txn_id,
                 position,
-                should_add,
             },
+            should_add_new_items: should_add,
         };
 
         TimelineEventHandler::new(self, ctx)
-            .handle_event(day_divider_adjuster, event_kind, Some(&raw), room_data_provider)
+            .handle_event(day_divider_adjuster, event_kind, Some(&raw))
             .await
     }
 
     fn clear(&mut self) {
+        let has_local_echoes = self.items.iter().any(|item| item.is_local_echo());
+
         // By first checking if there are any local echoes first, we do a bit
         // more work in case some are found, but it should be worth it because
         // there will often not be any, and only emitting a single
         // `VectorDiff::Clear` should be much more efficient to process for
         // subscribers.
-        if self.items.iter().any(|item| item.is_local_echo()) {
+        if has_local_echoes {
             // Remove all remote events and the read marker
             self.items.for_each(|entry| {
                 if entry.is_remote_event() || entry.is_read_marker() {
@@ -512,7 +613,11 @@ impl TimelineInnerStateTransaction<'_> {
             self.items.clear();
         }
 
-        self.meta.clear();
+        // Only clear the internal counter if there are no local echoes. Otherwise, we
+        // might end up reusing the same internal id for a local echo and
+        // another item.
+        let reset_internal_id = !has_local_echoes;
+        self.meta.clear(reset_internal_id);
 
         debug!(remaining_items = self.items.len(), "Timeline cleared");
     }
@@ -537,7 +642,7 @@ impl TimelineInnerStateTransaction<'_> {
         items.commit();
     }
 
-    /// Add or update an event in the [`TimelineInnerMeta::all_events`]
+    /// Add or update an event in the [`TimelineMetadata::all_events`]
     /// collection.
     ///
     /// This method also adjusts read receipt if needed.
@@ -550,9 +655,9 @@ impl TimelineInnerStateTransaction<'_> {
         event_meta: FullEventMeta<'_>,
         position: TimelineItemPosition,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) -> bool {
-        // Detect if an event already exists in [`TimelineInnerMeta::all_events`].
+        // Detect if an event already exists in [`TimelineMetadata::all_events`].
         //
         // Returns its position, in this case.
         fn event_already_exists(
@@ -581,7 +686,6 @@ impl TimelineInnerStateTransaction<'_> {
                 self.meta.all_events.push_back(event_meta.base_meta());
             }
 
-            #[cfg(feature = "e2e-encryption")]
             TimelineItemPosition::Update(_) => {
                 if let Some(event) =
                     self.meta.all_events.iter_mut().find(|e| e.event_id == event_meta.event_id)
@@ -618,8 +722,24 @@ impl TimelineInnerStateTransaction<'_> {
     }
 }
 
+#[derive(Clone)]
+pub(in crate::timeline) enum PendingEdit {
+    RoomMessage(Replacement<RoomMessageEventContentWithoutRelation>),
+    Poll(Replacement<NewUnstablePollStartEventContentWithoutRelation>),
+}
+
+#[cfg(not(tarpaulin_include))]
+impl std::fmt::Debug for PendingEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RoomMessage(_) => f.debug_struct("RoomMessage").finish_non_exhaustive(),
+            Self::Poll(_) => f.debug_struct("Poll").finish_non_exhaustive(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-pub(in crate::timeline) struct TimelineInnerMetadata {
+pub(in crate::timeline) struct TimelineMetadata {
     // **** CONSTANT FIELDS ****
     /// An optional prefix for internal IDs, defined during construction of the
     /// timeline.
@@ -632,12 +752,20 @@ pub(in crate::timeline) struct TimelineInnerMetadata {
     /// This value is constant over the lifetime of the metadata.
     pub(crate) unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
 
+    /// A boolean indicating whether the room the timeline is attached to is
+    /// actually encrypted or not.
+    /// TODO: this is misplaced, it should be part of the room provider as this
+    /// value can change over time when a room switches from non-encrypted
+    /// to encrypted, see also #3850.
     pub(crate) is_room_encrypted: bool,
 
     /// Matrix room version of the timeline's room, or a sensible default.
     ///
     /// This value is constant over the lifetime of the metadata.
     pub room_version: RoomVersionId,
+
+    /// The own [`OwnedUserId`] of the client who opened the timeline.
+    own_user_id: OwnedUserId,
 
     // **** DYNAMIC FIELDS ****
     /// The next internal identifier for timeline items, used for both local and
@@ -648,8 +776,18 @@ pub(in crate::timeline) struct TimelineInnerMetadata {
     /// are discarded in the timeline items.
     pub all_events: VecDeque<EventMeta>,
 
+    /// State helping matching reactions to their associated events, and
+    /// stashing pending reactions.
     pub reactions: Reactions,
-    pub poll_pending_events: PollPendingEvents,
+
+    /// Associated poll events received before their original poll start event.
+    pub pending_poll_events: PendingPollEvents,
+
+    /// Edit events received before the related event they're editing.
+    pub pending_edits: RingBuffer<(OwnedEventId, PendingEdit)>,
+
+    /// Identifier of the fully-read event, helping knowing where to introduce
+    /// the read marker.
     pub fully_read_event: Option<OwnedEventId>,
 
     /// Whether we have a fully read-marker item in the timeline, that's up to
@@ -660,21 +798,31 @@ pub(in crate::timeline) struct TimelineInnerMetadata {
     /// - The fully-read marker item would be the last item in the timeline.
     pub has_up_to_date_read_marker_item: bool,
 
+    /// Read receipts related state.
+    ///
+    /// TODO: move this over to the event cache (see also #3058).
     pub read_receipts: ReadReceipts,
 }
 
-impl TimelineInnerMetadata {
+/// Maximum number of stash pending edits.
+/// SAFETY: 32 is not 0.
+const MAX_NUM_STASHED_PENDING_EDITS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(32) };
+
+impl TimelineMetadata {
     pub(crate) fn new(
+        own_user_id: OwnedUserId,
         room_version: RoomVersionId,
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: bool,
     ) -> Self {
         Self {
+            own_user_id,
             all_events: Default::default(),
             next_internal_id: Default::default(),
             reactions: Default::default(),
-            poll_pending_events: Default::default(),
+            pending_poll_events: Default::default(),
+            pending_edits: RingBuffer::new(MAX_NUM_STASHED_PENDING_EDITS),
             fully_read_event: Default::default(),
             // It doesn't make sense to set this to false until we fill the `fully_read_event`
             // field, otherwise we'll keep on exiting early in `Self::update_read_marker`.
@@ -687,11 +835,14 @@ impl TimelineInnerMetadata {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.next_internal_id = 0;
+    pub(crate) fn clear(&mut self, reset_internal_id: bool) {
+        if reset_internal_id {
+            self.next_internal_id = 0;
+        }
         self.all_events.clear();
         self.reactions.clear();
-        self.poll_pending_events.clear();
+        self.pending_poll_events.clear();
+        self.pending_edits.clear();
         self.fully_read_event = None;
         // We forgot about the fully read marker right above, so wait for a new one
         // before attempting to update it for each new timeline item.
@@ -751,7 +902,38 @@ impl TimelineInnerMetadata {
         trace!(?fully_read_event, "Updating read marker");
 
         let read_marker_idx = items.iter().rposition(|item| item.is_read_marker());
-        let fully_read_event_idx = rfind_event_by_id(items, fully_read_event).map(|(idx, _)| idx);
+
+        let mut fully_read_event_idx =
+            rfind_event_by_id(items, fully_read_event).map(|(idx, _)| idx);
+
+        if let Some(i) = &mut fully_read_event_idx {
+            // The item at position `i` is the first item that's fully read, we're about to
+            // insert a read marker just after it.
+            //
+            // Do another forward pass to skip all the events we've sent too.
+
+            // Find the position of the first element…
+            let next = items
+                .iter()
+                .enumerate()
+                // …strictly *after* the fully read event…
+                .skip(*i + 1)
+                // …that's not virtual and not sent by us…
+                .find(|(_, item)| {
+                    item.as_event().map_or(false, |event| event.sender() != self.own_user_id)
+                })
+                .map(|(i, _)| i);
+
+            if let Some(next) = next {
+                // `next` point to the first item that's not sent by us, so the *previous* of
+                // next is the right place where to insert the fully read marker.
+                *i = next.wrapping_sub(1);
+            } else {
+                // There's no event after the read marker that's not sent by us, i.e. the full
+                // timeline has been read: the fully read marker goes to the end.
+                *i = items.len().wrapping_sub(1);
+            }
+        }
 
         match (read_marker_idx, fully_read_event_idx) {
             (None, None) => {

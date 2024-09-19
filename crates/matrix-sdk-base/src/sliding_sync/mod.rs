@@ -26,7 +26,10 @@ use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
 use ruma::events::AnyToDeviceEvent;
 use ruma::{
     api::client::sync::sync_events::v3::{self, InvitedRoom},
-    events::{AnyRoomAccountDataEvent, AnySyncStateEvent, AnySyncTimelineEvent},
+    events::{
+        AnyRoomAccountDataEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+        GlobalAccountDataEventType,
+    },
     serde::Raw,
     JsOption, OwnedRoomId, RoomId, UInt,
 };
@@ -119,15 +122,14 @@ impl BaseClient {
     ///   sync.
     /// * `previous_events_provider` - Timeline events prior to the current
     ///   sync.
-    /// * `from_simplified_sliding_sync` - Whether the `response` comes from
-    ///   simplified sliding sync (Simplified MSC3575), or sliding sync
-    ///   (MSC3575).
+    /// * `with_msc4186` - Whether the `response` comes from simplified sliding
+    ///   sync (MSC4186) or sliding sync (MSC3575).
     #[instrument(skip_all, level = "trace")]
     pub async fn process_sliding_sync<PEP: PreviousEventsProvider>(
         &self,
         response: &http::Response,
         previous_events_provider: &PEP,
-        from_simplified_sliding_sync: bool,
+        with_msc4186: bool,
     ) -> Result<SyncResponse> {
         let http::Response {
             // FIXME not yet supported by sliding sync. see
@@ -162,9 +164,11 @@ impl BaseClient {
         let mut ambiguity_cache = AmbiguityCache::new(store.inner.clone());
 
         let account_data = &extensions.account_data;
-        if !account_data.is_empty() {
-            self.handle_account_data(&account_data.global, &mut changes).await;
-        }
+        let global_account_data_events = if !account_data.is_empty() {
+            self.handle_account_data(&account_data.global, &mut changes).await
+        } else {
+            Vec::new()
+        };
 
         let mut new_rooms = RoomUpdates::default();
         let mut notifications = Default::default();
@@ -181,7 +185,7 @@ impl BaseClient {
                     &mut room_info_notable_updates,
                     &mut notifications,
                     &mut ambiguity_cache,
-                    from_simplified_sliding_sync,
+                    with_msc4186,
                 )
                 .await?;
 
@@ -300,12 +304,24 @@ impl BaseClient {
             }
         }
 
-        // TODO remove this, we're processing account data events here again
+        // We're processing direct state events here separately
         // because we want to have the push rules in place before we process
         // rooms and their events, but we want to create the rooms before we
         // process the `m.direct` account data event.
-        if !account_data.is_empty() {
-            self.handle_account_data(&account_data.global, &mut changes).await;
+        let has_new_direct_room_data = global_account_data_events
+            .iter()
+            .any(|event| event.event_type() == GlobalAccountDataEventType::Direct);
+        if has_new_direct_room_data {
+            self.process_direct_rooms(&global_account_data_events, &mut changes).await;
+        } else if let Ok(Some(direct_account_data)) =
+            self.store.get_account_data_event(GlobalAccountDataEventType::Direct).await
+        {
+            debug!("Found direct room data in the Store, applying it");
+            if let Ok(direct_account_data) = direct_account_data.deserialize() {
+                self.process_direct_rooms(&[direct_account_data], &mut changes).await;
+            } else {
+                warn!("Failed to deserialize direct room account data");
+            }
         }
 
         // FIXME not yet supported by sliding sync.
@@ -353,7 +369,7 @@ impl BaseClient {
         room_info_notable_updates: &mut BTreeMap<OwnedRoomId, RoomInfoNotableUpdateReasons>,
         notifications: &mut BTreeMap<OwnedRoomId, Vec<Notification>>,
         ambiguity_cache: &mut AmbiguityCache,
-        from_simplified_sliding_sync: bool,
+        with_msc4186: bool,
     ) -> Result<(RoomInfo, Option<JoinedRoomUpdate>, Option<LeftRoomUpdate>, Option<InvitedRoom>)>
     {
         // This method may change `room_data` (see the terrible hack describes below)
@@ -381,10 +397,10 @@ impl BaseClient {
         // `timestamp` despites having `m.room.create` in `bump_event_types`. The result
         // of this is that an invite cannot be sorted. This horrible hack will fix that.
         //
-        // The SDK manipulates Simplified MSC3575 `Request` and `Response` though. In
-        // Simplified MSC3575, `bump_stamp` replaces `timestamp`, which does NOT
-        // represent a time! This hack must really, only, apply to the proxy, so to
-        // MSC3575 strictly (hence the `from_simplified_sliding_sync` argument).
+        // The SDK manipulates MSC4186 `Request` and `Response` though. In MSC4186,
+        // `bump_stamp` replaces `timestamp`, which does NOT represent a time! This
+        // hack must really, only, apply to the proxy, so to MSC3575 strictly (hence
+        // the `with_msc4186` argument).
         //
         // The proxy uses the `origin_server_ts` event's value to fill the `timestamp`
         // room's value (which is a bad idea[^1]). If `timestamp` is `None`, let's find
@@ -392,9 +408,8 @@ impl BaseClient {
         //
         // [^1]: using `origin_server_ts` for `timestamp` is a bad idea because
         // this value can be forged by a malicious user. Anyway, that's how it works
-        // in the proxy. Simplified MSC3575 has another mechanism which fixes the
-        // problem.
-        if !from_simplified_sliding_sync && room_data.bump_stamp.is_none() {
+        // in the proxy. MSC4186 has another mechanism which fixes the problem.
+        if !with_msc4186 && room_data.bump_stamp.is_none() {
             if let Some(invite_state) = &room_data.invite_state {
                 room_data.to_mut().bump_stamp =
                     invite_state.iter().rev().find_map(|invite_state| {
@@ -1432,7 +1447,7 @@ mod tests {
 
     #[async_test]
     async fn test_invitation_room_receive_a_default_timestamp_on_not_simplified_sliding_sync() {
-        const NOT_SIMPLIFIED_SLIDING_SYNC: bool = false;
+        const NOT_MSC4186: bool = false;
 
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
@@ -1445,7 +1460,7 @@ mod tests {
         set_room_invited(&mut room, user_id, user_id);
         let response = response_with_room(room_id, room);
         let _sync_resp = client
-            .process_sliding_sync(&response, &(), NOT_SIMPLIFIED_SLIDING_SYNC)
+            .process_sliding_sync(&response, &(), NOT_MSC4186)
             .await
             .expect("Failed to process sync");
 
@@ -1491,7 +1506,7 @@ mod tests {
 
         let response = response_with_room(room_id, room);
         let _sync_resp = client
-            .process_sliding_sync(&response, &(), NOT_SIMPLIFIED_SLIDING_SYNC)
+            .process_sliding_sync(&response, &(), NOT_MSC4186)
             .await
             .expect("Failed to process sync");
 
@@ -2312,6 +2327,41 @@ mod tests {
         client.process_sliding_sync(&response, &(), true).await.expect("Failed to process sync");
         let pinned_event_ids = room.pinned_event_ids();
         assert!(pinned_event_ids.is_empty());
+    }
+
+    #[async_test]
+    async fn test_dms_are_processed_in_any_sync_response() {
+        let current_user_id = user_id!("@current:e.uk");
+        let client = logged_in_base_client(Some(current_user_id)).await;
+        let user_a_id = user_id!("@a:e.uk");
+        let user_b_id = user_id!("@b:e.uk");
+        let room_id_1 = room_id!("!r:e.uk");
+        let room_id_2 = room_id!("!s:e.uk");
+
+        let mut room_response = http::response::Room::new();
+        set_room_joined(&mut room_response, user_a_id);
+        let mut response = response_with_room(room_id_1, room_response);
+        let mut direct_content = BTreeMap::new();
+        direct_content.insert(user_a_id.to_owned(), vec![room_id_1.to_owned()]);
+        direct_content.insert(user_b_id.to_owned(), vec![room_id_2.to_owned()]);
+        response
+            .extensions
+            .account_data
+            .global
+            .push(make_global_account_data_event(DirectEventContent(direct_content)));
+        client.process_sliding_sync(&response, &(), true).await.expect("Failed to process sync");
+
+        let room_1 = client.get_room(room_id_1).unwrap();
+        assert!(room_1.is_direct().await.unwrap());
+
+        // Now perform a sync without new account data
+        let mut room_response = http::response::Room::new();
+        set_room_joined(&mut room_response, user_b_id);
+        let response = response_with_room(room_id_2, room_response);
+        client.process_sliding_sync(&response, &(), true).await.expect("Failed to process sync");
+
+        let room_2 = client.get_room(room_id_2).unwrap();
+        assert!(room_2.is_direct().await.unwrap());
     }
 
     async fn choose_event_to_cache(events: &[SyncTimelineEvent]) -> Option<SyncTimelineEvent> {

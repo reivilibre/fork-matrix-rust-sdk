@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fmt, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Object as SqliteConn, Pool as SqlitePool, Runtime};
+use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     event_cache_store::EventCacheStore,
     media::{MediaRequest, UniqueKey},
@@ -13,9 +13,8 @@ use tracing::debug;
 
 use crate::{
     error::{Error, Result},
-    get_or_create_store_cipher,
-    utils::{load_db_version, Key, SqliteObjectExt},
-    OpenStoreError, SqliteObjectStoreExt,
+    utils::{Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt, SqliteKeyValueStoreConnExt},
+    OpenStoreError,
 };
 
 mod keys {
@@ -63,41 +62,15 @@ impl SqliteEventCacheStore {
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        let mut version = load_db_version(&conn).await?;
-
-        if version == 0 {
-            init(&conn).await?;
-            version = 1;
-        }
+        let version = conn.db_version().await?;
+        run_migrations(&conn, version).await?;
 
         let store_cipher = match passphrase {
-            Some(p) => Some(Arc::new(get_or_create_store_cipher(p, &conn).await?)),
+            Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
             None => None,
         };
-        let this = Self { store_cipher, pool };
-        this.run_migrations(&conn, version, None).await?;
 
-        Ok(this)
-    }
-
-    /// Run database migrations from the given `from` version to the given `to`
-    /// version
-    ///
-    /// If `to` is `None`, the current database version will be used.
-    async fn run_migrations(&self, conn: &SqliteConn, from: u8, to: Option<u8>) -> Result<()> {
-        let to = to.unwrap_or(DATABASE_VERSION);
-
-        if from < to {
-            debug!(version = from, new_version = to, "Upgrading database");
-        } else {
-            return Ok(());
-        }
-
-        // There is no migration currently since it's the first version of the database.
-
-        conn.set_kv("version", vec![to]).await?;
-
-        Ok(())
+        Ok(Self { store_cipher, pool })
     }
 
     fn encode_value(&self, value: Vec<u8>) -> Result<Vec<u8>> {
@@ -128,7 +101,7 @@ impl SqliteEventCacheStore {
         }
     }
 
-    async fn acquire(&self) -> Result<SqliteConn> {
+    async fn acquire(&self) -> Result<SqliteAsyncConn> {
         Ok(self.pool.get().await?)
     }
 }
@@ -139,17 +112,26 @@ async fn create_pool(path: &Path) -> Result<SqlitePool, OpenStoreError> {
     Ok(cfg.create_pool(Runtime::Tokio1)?)
 }
 
-/// Initialize the database.
-async fn init(conn: &SqliteConn) -> Result<()> {
-    // First turn on WAL mode, this can't be done in the transaction, it fails with
-    // the error message: "cannot change into wal mode from within a transaction".
-    conn.execute_batch("PRAGMA journal_mode = wal;").await?;
-    conn.with_transaction(|txn| {
-        txn.execute_batch(include_str!("../migrations/event_cache_store/001_init.sql"))
-    })
-    .await?;
+/// Run migrations for the given version of the database.
+async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
+    if version == 0 {
+        debug!("Creating database");
+    } else if version < DATABASE_VERSION {
+        debug!(version, new_version = DATABASE_VERSION, "Upgrading database");
+    } else {
+        return Ok(());
+    }
 
-    conn.set_kv("version", vec![1]).await?;
+    if version < 1 {
+        // First turn on WAL mode, this can't be done in the transaction, it fails with
+        // the error message: "cannot change into wal mode from within a transaction".
+        conn.execute_batch("PRAGMA journal_mode = wal;").await?;
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!("../migrations/event_cache_store/001_init.sql"))?;
+            txn.set_db_version(1)
+        })
+        .await?;
+    }
 
     Ok(())
 }
@@ -180,25 +162,21 @@ impl EventCacheStore for SqliteEventCacheStore {
         let conn = self.acquire().await?;
         let data = conn
             .with_transaction::<_, rusqlite::Error, _>(move |txn| {
-                let Some(media) = txn
-                    .query_row::<Vec<u8>, _, _>(
-                        "SELECT data FROM media WHERE uri = ? AND format = ?",
-                        (&uri, &format),
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                else {
-                    return Ok(None);
-                };
-
                 // Update the last access.
+                // We need to do this first so the transaction is in write mode right away.
+                // See: https://sqlite.org/lang_transaction.html#read_transactions_versus_write_transactions
                 txn.execute(
                     "UPDATE media SET last_access = CAST(strftime('%s') as INT) \
                      WHERE uri = ? AND format = ?",
-                    (uri, format),
+                    (&uri, &format),
                 )?;
 
-                Ok(Some(media))
+                txn.query_row::<Vec<u8>, _, _>(
+                    "SELECT data FROM media WHERE uri = ? AND format = ?",
+                    (&uri, &format),
+                    |row| row.get(0),
+                )
+                .optional()
             })
             .await?;
 
@@ -243,7 +221,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::SqliteEventCacheStore;
-    use crate::utils::SqliteObjectExt;
+    use crate::utils::SqliteAsyncConnExt;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);

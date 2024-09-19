@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Object as SqliteConn, Pool as SqlitePool, Runtime};
+use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     deserialized_responses::{RawAnySyncOrStrippedState, SyncOrStrippedState},
     store::{
@@ -41,9 +41,11 @@ use tracing::{debug, warn};
 
 use crate::{
     error::{Error, Result},
-    get_or_create_store_cipher,
-    utils::{load_db_version, repeat_vars, Key, SqliteObjectExt},
-    OpenStoreError, SqliteObjectStoreExt,
+    utils::{
+        repeat_vars, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
+        SqliteKeyValueStoreConnExt,
+    },
+    OpenStoreError,
 };
 
 mod keys {
@@ -101,7 +103,7 @@ impl SqliteStateStore {
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        let mut version = load_db_version(&conn).await?;
+        let mut version = conn.db_version().await?;
 
         if version == 0 {
             init(&conn).await?;
@@ -109,7 +111,7 @@ impl SqliteStateStore {
         }
 
         let store_cipher = match passphrase {
-            Some(p) => Some(Arc::new(get_or_create_store_cipher(p, &conn).await?)),
+            Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
             None => None,
         };
         let this = Self { store_cipher, pool };
@@ -122,7 +124,7 @@ impl SqliteStateStore {
     /// version
     ///
     /// If `to` is `None`, the current database version will be used.
-    async fn run_migrations(&self, conn: &SqliteConn, from: u8, to: Option<u8>) -> Result<()> {
+    async fn run_migrations(&self, conn: &SqliteAsyncConn, from: u8, to: Option<u8>) -> Result<()> {
         let to = to.unwrap_or(DATABASE_VERSION);
 
         if from < to {
@@ -162,6 +164,7 @@ impl SqliteStateStore {
                     "../migrations/state_store/002_b_replace_room_info.sql"
                 ))?;
 
+                txn.set_db_version(2)?;
                 Result::<_, Error>::Ok(())
             })
             .await?;
@@ -212,6 +215,7 @@ impl SqliteStateStore {
                         .execute((data, room_id))?;
                 }
 
+                txn.set_db_version(3)?;
                 Result::<_, Error>::Ok(())
             })
             .await?;
@@ -221,7 +225,7 @@ impl SqliteStateStore {
             conn.with_transaction(move |txn| {
                 // Create new table.
                 txn.execute_batch(include_str!("../migrations/state_store/003_send_queue.sql"))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(4)
             })
             .await?;
         }
@@ -232,7 +236,7 @@ impl SqliteStateStore {
                 txn.execute_batch(include_str!(
                     "../migrations/state_store/004_send_queue_with_roomid_value.sql"
                 ))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(4)
             })
             .await?;
         }
@@ -243,7 +247,7 @@ impl SqliteStateStore {
                 txn.execute_batch(include_str!(
                     "../migrations/state_store/005_send_queue_dependent_events.sql"
                 ))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(6)
             })
             .await?;
         }
@@ -252,12 +256,10 @@ impl SqliteStateStore {
             conn.with_transaction(move |txn| {
                 // Drop media table.
                 txn.execute_batch(include_str!("../migrations/state_store/006_drop_media.sql"))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(7)
             })
             .await?;
         }
-
-        conn.set_kv("version", vec![to]).await?;
 
         Ok(())
     }
@@ -346,7 +348,7 @@ impl SqliteStateStore {
         self.encode_key(keys::KV_BLOB, full_key)
     }
 
-    async fn acquire(&self) -> Result<SqliteConn> {
+    async fn acquire(&self) -> Result<SqliteAsyncConn> {
         Ok(self.pool.get().await?)
     }
 
@@ -371,18 +373,17 @@ async fn create_pool(path: &Path) -> Result<SqlitePool, OpenStoreError> {
 }
 
 /// Initialize the database.
-async fn init(conn: &SqliteConn) -> Result<()> {
+async fn init(conn: &SqliteAsyncConn) -> Result<()> {
     // First turn on WAL mode, this can't be done in the transaction, it fails with
     // the error message: "cannot change into wal mode from within a transaction".
     conn.execute_batch("PRAGMA journal_mode = wal;").await?;
     conn.with_transaction(|txn| {
-        txn.execute_batch(include_str!("../migrations/state_store/001_init.sql"))
+        txn.execute_batch(include_str!("../migrations/state_store/001_init.sql"))?;
+        txn.set_db_version(1)?;
+
+        Ok(())
     })
-    .await?;
-
-    conn.set_kv("version", vec![1]).await?;
-
-    Ok(())
+    .await
 }
 
 trait SqliteConnectionStateStoreExt {
@@ -665,7 +666,7 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
 }
 
 #[async_trait]
-trait SqliteObjectStateStoreExt: SqliteObjectExt {
+trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
     async fn get_kv_blob(&self, key: Key) -> Result<Option<Vec<u8>>> {
         Ok(self
             .query_row("SELECT value FROM kv_blob WHERE key = ?", (key,), |row| row.get(0))
@@ -906,7 +907,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 }
 
 #[async_trait]
-impl SqliteObjectStateStoreExt for SqliteConn {
+impl SqliteObjectStateStoreExt for SqliteAsyncConn {
     async fn set_kv_blob(&self, key: Key, value: Vec<u8>) -> Result<()> {
         Ok(self.interact(move |conn| conn.set_kv_blob(&key, &value)).await.unwrap()?)
     }
@@ -2008,8 +2009,7 @@ mod migration_tests {
     use super::{create_pool, init, keys, SqliteStateStore};
     use crate::{
         error::{Error, Result},
-        get_or_create_store_cipher,
-        utils::SqliteObjectExt,
+        utils::{SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt},
     };
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
@@ -2027,7 +2027,7 @@ mod migration_tests {
 
         init(&conn).await?;
 
-        let store_cipher = Some(Arc::new(get_or_create_store_cipher(SECRET, &conn).await.unwrap()));
+        let store_cipher = Some(Arc::new(conn.get_or_create_store_cipher(SECRET).await.unwrap()));
         let this = SqliteStateStore { store_cipher, pool };
         this.run_migrations(&conn, 1, Some(version)).await?;
 

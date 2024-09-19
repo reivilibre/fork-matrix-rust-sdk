@@ -23,9 +23,14 @@ qrcode = ["matrix-sdk-crypto?/qrcode"]
 automatic-room-key-forwarding = ["matrix-sdk-crypto?/automatic-room-key-forwarding"]
 experimental-sliding-sync = [
     "ruma/unstable-msc3575",
-    "ruma/unstable-simplified-msc3575",
+    "ruma/unstable-msc4186",
 ]
 uniffi = ["dep:uniffi", "matrix-sdk-crypto?/uniffi", "matrix-sdk-common/uniffi"]
+
+# Private feature, see
+# https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823 for the gory
+# details.
+test-send-sync = []
 
 # "message-ids" feature doesn't do anything and is deprecated.
 message-ids = []

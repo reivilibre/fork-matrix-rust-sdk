@@ -228,7 +228,22 @@ pub(crate) struct ClientInner {
     /// All the data related to authentication and authorization.
     pub(crate) auth_ctx: Arc<AuthCtx>,
 
+    /// The URL of the server.
+    ///
+    /// Not to be confused with the `Self::homeserver`. `server` is usually
+    /// the server part in a user ID, e.g. with `@mnt_io:matrix.org`, here
+    /// `matrix.org` is the server, whilst `matrix-client.matrix.org` is the
+    /// homeserver (at the time of writing — 2024-08-28).
+    ///
+    /// This value is optional depending on how the `Client` has been built.
+    /// If it's been built from a homeserver URL directly, we don't know the
+    /// server. However, if the `Client` has been built from a server URL or
+    /// name, then the homeserver has been discovered, and we know both.
+    server: Option<Url>,
+
     /// The URL of the homeserver to connect to.
+    ///
+    /// This is the URL for the client-server Matrix API.
     homeserver: StdRwLock<Url>,
 
     #[cfg(feature = "experimental-sliding-sync")]
@@ -305,6 +320,7 @@ impl ClientInner {
     #[allow(clippy::too_many_arguments)]
     async fn new(
         auth_ctx: Arc<AuthCtx>,
+        server: Option<Url>,
         homeserver: Url,
         #[cfg(feature = "experimental-sliding-sync")] sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
@@ -316,6 +332,7 @@ impl ClientInner {
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
     ) -> Arc<Self> {
         let client = Self {
+            server,
             homeserver: StdRwLock::new(homeserver),
             auth_ctx,
             #[cfg(feature = "experimental-sliding-sync")]
@@ -454,7 +471,14 @@ impl Client {
         self.inner.base_client.logged_in()
     }
 
-    /// The Homeserver of the client.
+    /// The server used by the client.
+    ///
+    /// See `Self::server` to learn more.
+    pub fn server(&self) -> Option<&Url> {
+        self.inner.server.as_ref()
+    }
+
+    /// The homeserver of the client.
     pub fn homeserver(&self) -> Url {
         self.inner.homeserver.read().unwrap().clone()
     }
@@ -1180,7 +1204,7 @@ impl Client {
         server_names: &[OwnedServerName],
     ) -> Result<Room> {
         let request = assign!(join_room_by_id_or_alias::v3::Request::new(alias.to_owned()), {
-            server_name: server_names.to_owned(),
+            via: server_names.to_owned(),
         });
         let response = self.send(request, None).await?;
         let base_room = self.base_client().room_joined(&response.room_id).await?;
@@ -2175,11 +2199,12 @@ impl Client {
         let client = Client {
             inner: ClientInner::new(
                 self.inner.auth_ctx.clone(),
+                self.server().cloned(),
                 self.homeserver(),
                 #[cfg(feature = "experimental-sliding-sync")]
                 self.sliding_sync_version(),
                 self.inner.http_client.clone(),
-                self.inner.base_client.clone_with_in_memory_state_store(),
+                self.inner.base_client.clone_with_in_memory_state_store().await?,
                 self.inner.server_capabilities.read().await.clone(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
@@ -2190,23 +2215,6 @@ impl Client {
             .await,
         };
 
-        // Copy the parent's session meta into the child. This initializes the in-memory
-        // state store of the child client with `SessionMeta`, and regenerates
-        // the `OlmMachine` if needs be.
-        //
-        // Note: we don't need to do a full `restore_session`, because this would
-        // overwrite the session information shared with the parent too, and it
-        // must be initialized at most once.
-        if let Some(session) = self.session() {
-            client
-                .set_session_meta(
-                    session.into_meta(),
-                    #[cfg(feature = "e2e-encryption")]
-                    None,
-                )
-                .await?;
-        }
-
         Ok(client)
     }
 
@@ -2214,6 +2222,26 @@ impl Client {
     pub fn event_cache(&self) -> &EventCache {
         // SAFETY: always initialized in the `Client` ctor.
         self.inner.event_cache.get().unwrap()
+    }
+
+    /// Waits until an at least partially synced room is received, and returns
+    /// it.
+    ///
+    /// **Note: this function will loop endlessly until either it finds the room
+    /// or an externally set timeout happens.**
+    pub async fn await_room_remote_echo(&self, room_id: &RoomId) -> Room {
+        loop {
+            if let Some(room) = self.get_room(room_id) {
+                if room.is_state_partially_or_fully_synced() {
+                    debug!("Found just created room!");
+                    return room;
+                }
+                debug!("Room wasn't partially synced, waiting for sync beat to try again");
+            } else {
+                debug!("Room wasn't found, waiting for sync beat to try again");
+            }
+            self.inner.sync_beat.listen().await;
+        }
     }
 }
 
@@ -2263,6 +2291,7 @@ pub(crate) mod tests {
     use std::{sync::Arc, time::Duration};
 
     use assert_matches::assert_matches;
+    use futures_util::FutureExt;
     use matrix_sdk_base::{
         store::{MemoryStore, StoreConfig},
         RoomState,
@@ -2275,12 +2304,19 @@ pub(crate) mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use ruma::{
-        api::MatrixVersion, events::ignored_user_list::IgnoredUserListEventContent, owned_room_id,
-        room_id, RoomId, ServerName, UserId,
+        api::{client::room::create_room::v3::Request as CreateRoomRequest, MatrixVersion},
+        assign,
+        events::ignored_user_list::IgnoredUserListEventContent,
+        owned_room_id, room_id, RoomId, ServerName, UserId,
+    };
+    use serde_json::json;
+    use tokio::{
+        spawn,
+        time::{sleep, timeout},
     };
     use url::Url;
     use wiremock::{
-        matchers::{body_json, header, method, path},
+        matchers::{body_json, header, method, path, query_param_is_missing},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -2288,7 +2324,10 @@ pub(crate) mod tests {
     use crate::{
         client::WeakClient,
         config::{RequestConfig, SyncSettings},
-        test_utils::{logged_in_client, no_retry_test_client, test_client_builder},
+        test_utils::{
+            logged_in_client, no_retry_test_client, set_client_session, test_client_builder,
+            test_client_builder_with_server,
+        },
         Error,
     };
 
@@ -2321,32 +2360,42 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_successful_discovery() {
+        // Imagine this is `matrix.org`.
         let server = MockServer::start().await;
+
+        // Imagine this is `matrix-client.matrix.org`.
+        let homeserver = MockServer::start().await;
+
+        // Imagine Alice has the user ID `@alice:matrix.org`.
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let alice = UserId::parse("@alice:".to_owned() + domain).unwrap();
 
+        // The `.well-known` is on the server (e.g. `matrix.org`).
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
-                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", server_url.as_ref()),
+                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", &homeserver.uri()),
                 "application/json",
             ))
             .mount(&server)
             .await;
 
+        // The `/versions` is on the homeserver (e.g. `matrix-client.matrix.org`).
         Mock::given(method("GET"))
             .and(path("/_matrix/client/versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .mount(&server)
+            .mount(&homeserver)
             .await;
+
         let client = Client::builder()
             .insecure_server_name_no_tls(alice.server_name())
             .build()
             .await
             .unwrap();
 
-        assert_eq!(client.homeserver(), Url::parse(server_url.as_ref()).unwrap());
+        assert_eq!(client.server().unwrap(), &Url::parse(&server.uri()).unwrap());
+        assert_eq!(client.homeserver(), Url::parse(&homeserver.uri()).unwrap());
     }
 
     #[async_test]
@@ -2605,7 +2654,7 @@ pub(crate) mod tests {
         let client = logged_in_client(None).await;
 
         // Wait for the init tasks to die.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(1)).await;
 
         let weak_client = WeakClient::from_client(&client);
         assert_eq!(weak_client.strong_count(), 1);
@@ -2628,7 +2677,7 @@ pub(crate) mod tests {
         drop(client);
 
         // Give a bit of time for background tasks to die.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(1)).await;
 
         // The weak client must be the last reference to the client now.
         assert_eq!(weak_client.strong_count(), 0);
@@ -2722,5 +2771,127 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|version| *version == MatrixVersion::V1_0));
+    }
+
+    #[async_test]
+    async fn test_no_network_doesnt_cause_infinite_retries() {
+        // Note: not `no_retry_test_client` or `logged_in_client` which uses the former,
+        // since we want infinite retries for transient errors.
+        let client =
+            test_client_builder(None).request_config(RequestConfig::new()).build().await.unwrap();
+        set_client_session(&client).await;
+
+        // We don't define a mock server on purpose here, so that the error is really a
+        // network error.
+        client.whoami().await.unwrap_err();
+    }
+
+    #[async_test]
+    async fn test_await_room_remote_echo_returns_the_room_if_it_was_already_synced() {
+        let (client_builder, server) = test_client_builder_with_server().await;
+        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
+        set_client_session(&client).await;
+
+        let builder = Mock::given(method("GET"))
+            .and(path("/_matrix/client/r0/sync"))
+            .and(header("authorization", "Bearer 1234"))
+            .and(query_param_is_missing("since"));
+
+        let room_id = room_id!("!room:example.org");
+        let joined_room_builder = JoinedRoomBuilder::new(room_id);
+        let mut sync_response_builder = SyncResponseBuilder::new();
+        sync_response_builder.add_joined_room(joined_room_builder);
+        let response_body = sync_response_builder.build_json_sync_response();
+
+        builder
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&server)
+            .await;
+
+        client.sync_once(SyncSettings::default()).await.unwrap();
+
+        let room = client.await_room_remote_echo(room_id).now_or_never().unwrap();
+        assert_eq!(room.room_id(), room_id);
+    }
+
+    #[async_test]
+    async fn test_await_room_remote_echo_returns_the_room_when_it_is_ready() {
+        let (client_builder, server) = test_client_builder_with_server().await;
+        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
+        set_client_session(&client).await;
+
+        let builder = Mock::given(method("GET"))
+            .and(path("/_matrix/client/r0/sync"))
+            .and(header("authorization", "Bearer 1234"))
+            .and(query_param_is_missing("since"));
+
+        let room_id = room_id!("!room:example.org");
+        let joined_room_builder = JoinedRoomBuilder::new(room_id);
+        let mut sync_response_builder = SyncResponseBuilder::new();
+        sync_response_builder.add_joined_room(joined_room_builder);
+        let response_body = sync_response_builder.build_json_sync_response();
+
+        builder
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(client);
+
+        // Perform the /sync request with a delay so it starts after the
+        // `await_room_remote_echo` call has happened
+        spawn({
+            let client = client.clone();
+            async move {
+                sleep(Duration::from_millis(100)).await;
+                client.sync_once(SyncSettings::default()).await.unwrap();
+            }
+        });
+
+        let room =
+            timeout(Duration::from_secs(10), client.await_room_remote_echo(room_id)).await.unwrap();
+        assert_eq!(room.room_id(), room_id);
+    }
+
+    #[async_test]
+    async fn test_await_room_remote_echo_will_timeout_if_no_room_is_found() {
+        let (client_builder, _) = test_client_builder_with_server().await;
+        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
+        set_client_session(&client).await;
+
+        let room_id = room_id!("!room:example.org");
+        // Room is not present so the client won't be able to find it. The call will
+        // timeout.
+        timeout(Duration::from_secs(1), client.await_room_remote_echo(room_id)).await.unwrap_err();
+    }
+
+    #[async_test]
+    async fn test_await_room_remote_echo_will_timeout_if_room_is_found_but_not_synced() {
+        let (client_builder, server) = test_client_builder_with_server().await;
+        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
+        set_client_session(&client).await;
+
+        Mock::given(method("POST"))
+            .and(path("_matrix/client/r0/createRoom"))
+            .and(header("authorization", "Bearer 1234"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "room_id": "!room:example.org"})),
+            )
+            .mount(&server)
+            .await;
+
+        // Create a room in the internal store
+        let room = client
+            .create_room(assign!(CreateRoomRequest::new(), {
+                invite: vec![],
+                is_direct: false,
+            }))
+            .await
+            .unwrap();
+
+        // Room is locally present, but not synced, the call will timeout
+        timeout(Duration::from_secs(1), client.await_room_remote_echo(room.room_id()))
+            .await
+            .unwrap_err();
     }
 }

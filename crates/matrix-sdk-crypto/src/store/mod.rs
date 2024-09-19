@@ -351,6 +351,10 @@ pub(crate) struct StoreCache {
 }
 
 impl StoreCache {
+    pub(crate) fn store_wrapper(&self) -> &CryptoStoreWrapper {
+        self.store.as_ref()
+    }
+
     /// Returns a reference to the `Account`.
     ///
     /// Either load the account from the cache, or the store if missing from
@@ -1944,7 +1948,7 @@ mod tests {
     use crate::{machine::test_helpers::get_machine_pair, types::EventEncryptionAlgorithm};
 
     #[async_test]
-    async fn import_room_keys_notifies_stream() {
+    async fn test_import_room_keys_notifies_stream() {
         use futures_util::FutureExt;
 
         let (alice, bob, _) =
@@ -1967,7 +1971,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_provides_selected_keys() {
+    async fn test_export_room_keys_provides_selected_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -1995,7 +1999,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_stream_can_provide_all_keys() {
+    async fn test_export_room_keys_stream_can_provide_all_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -2023,7 +2027,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_stream_can_provide_a_subset_of_keys() {
+    async fn test_export_room_keys_stream_can_provide_a_subset_of_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -2049,7 +2053,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_secrets_bundle() {
+    async fn test_export_secrets_bundle() {
         let user_id = user_id!("@alice:example.com");
         let (first, second, _) = get_machine_pair(user_id, user_id, false).await;
 
